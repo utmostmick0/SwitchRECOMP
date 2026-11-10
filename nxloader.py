@@ -5,6 +5,10 @@
 nxloader: NSO0/NRO0, MOD0, dynamic section, symbols, relocs, .eh_frame.
 Load addresses are decided here and baked into the generated code, the C runtime
 loads modules in the same order.
+
+Segment compression: classic LZ4, or ZBIC (Nintendo's zstd variant, NSO flag
+bit 7, system 22.0.0+/Switch 2). ZBIC needs the optional `zbic` python package;
+the rest of the tree works without it.
 """
 import os, struct, hashlib
 
@@ -15,6 +19,8 @@ except Exception:           # no lz4 module, use the slow pure python one
 
 CODE_BASE = 0x08000000      # same as hw (39-bit AS)
 PAGE = 0x1000
+NSO_ZBIC = 1 << 7           # module-wide: compressed segments are ZBIC, not LZ4
+SEG_NAMES = ('text', 'ro', 'data')
 
 
 def lz4_block(src, size):
@@ -39,6 +45,26 @@ def lz4_block(src, size):
         m += 4; p = len(out) - off
         for k in range(m): out.append(out[p + k])
     return bytes(out)
+
+
+def zbic_block(src, size, what='segment'):
+    """Nintendo ZBIC: zstd frame layout with a different magic and FSE table coding.
+    Stock zstandard cannot decode it (verified on Switch 2 NSOs). The `zbic`
+    package is a clean-room decoder for exactly this variant; it is optional and
+    only needed when flag bit 7 is set.
+    """
+    try:
+        import zbic
+    except ImportError:
+        raise ValueError('%s: ZBIC compressed segment needs the `zbic` python package '
+                         '(python3 -m pip install zbic)' % what)
+    try:
+        out = zbic.decompress(bytes(src))
+    except Exception as e:
+        raise ValueError('%s: ZBIC decompression failed (%s: %s)' % (what, type(e).__name__, e))
+    if len(out) != size:
+        raise ValueError('%s: ZBIC decompressed to %d bytes, header says %d' % (what, len(out), size))
+    return out
 
 
 def align(x, a=PAGE):
@@ -220,12 +246,14 @@ def load_nso(path, name=None):
     segs = [struct.unpack_from('<III', d, 0x10 + i * 0x10) for i in range(3)]
     fsz = struct.unpack_from('<III', d, 0x60)
     bss = struct.unpack_from('<I', d, 0x3C)[0]
+    zbic = bool(flags & NSO_ZBIC)
     size = segs[2][1] + segs[2][2]
     img = bytearray(size)
     for i, (foff, moff, sz) in enumerate(segs):
         raw = d[foff:foff + fsz[i]]
         if flags & (1 << i):
-            raw = lz4_block(raw, sz)
+            what = '%s %s' % (name or os.path.basename(path), SEG_NAMES[i])
+            raw = zbic_block(raw, sz, what) if zbic else lz4_block(raw, sz)
         # a short slice assignment would shrink the image and shift every later segment
         if len(raw) < sz or moff + sz > size:
             raise ValueError('%s: segment %d is truncated (damaged file?)' % (path, i))

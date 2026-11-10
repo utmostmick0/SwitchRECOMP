@@ -30,7 +30,8 @@ static SvcObj* new_sm(void){ return svcobj_new("sm:",sm_disp,0); }
 /* unknown service -> generic stub, everything succeeds */
 typedef struct { char name[16]; } GenData;
 
-static int generic_disp(SvcObj* o, IpcCtx* c){ extern int ipc_warn_once(const char*,u32); if(ipc_warn_once(((GenData*)o->data)->name,c->cmd)) WARN("  [not implemented] %s cmd %u -> ok\n",((GenData*)o->data)->name,c->cmd); return 0; }
+static int generic_disp(SvcObj* o, IpcCtx* c){ extern int ipc_warn_once(const char*,u32); extern void ipc_arg_str(IpcCtx*,char*,int);
+  if(ipc_warn_once(((GenData*)o->data)->name,c->cmd)){ char a[128]; ipc_arg_str(c,a,sizeof a); LOG("  [not implemented] %s cmd %u -> ok%s\n",((GenData*)o->data)->name,c->cmd,a); } return 0; }
 
 SvcObj* svc_generic(const char* n){ SvcObj* o=svcobj_new("generic",generic_disp,sizeof(GenData)); strncpy(((GenData*)o->data)->name,n,15); o->name=((GenData*)o->data)->name; return o; }
 
@@ -38,7 +39,8 @@ SvcObj* svc_generic(const char* n){ SvcObj* o=svcobj_new("generic",generic_disp,
    them shows up in the log */
 static int quiet_ok(SvcObj* o, IpcCtx* c){ static struct { const char* n; u32 cmd; } seen[96]; static int ns;
   for(int i=0;i<ns;i++) if(seen[i].n==o->name && seen[i].cmd==c->cmd) return 0;
-  if(ns<96){ seen[ns].n=o->name; seen[ns].cmd=c->cmd; ns++; LOG("ipc: %s cmd %u answered empty\n",o->name,c->cmd); }
+  if(ns<96){ seen[ns].n=o->name; seen[ns].cmd=c->cmd; ns++; char a[128]; ipc_arg_str(c,a,sizeof a);
+    LOG("ipc: %s cmd %u answered empty%s\n",o->name,c->cmd,a); }
   return 0; }
 
 static SvcObj* quiet(const char* name){ return svcobj_new(name,quiet_ok,0); }
@@ -47,11 +49,26 @@ static SvcObj* quiet(const char* name){ return svcobj_new(name,quiet_ok,0); }
 static u32 ev_handle(KEvent* e){ return h_new(&e->o); }
 
 /* ================================================================ am */
-static KEvent* g_msg_event; static u32 g_msgq[16]; static int g_nmsg;
+static KEvent* g_msg_event, *g_appfn_ev; static u32 g_msgq[16]; static int g_nmsg;
 static KEvent* g_launch_ev; static KEvent* g_res_ev; static KEvent* g_opmode_ev;
 static u64 g_user_id[2]={0x0123456789ABCDEFull,0xFEDCBA9876543210ull};
 
-static void am_push_msg(u32 m){ pm_lock(&g_klock); if(g_nmsg<16) g_msgq[g_nmsg++]=m; pm_unlock(&g_klock); kevent_signal(g_msg_event); }
+/* nxnative (dm/host/hle_oe.c) documents the rule for the applet notification
+   event: signalled while a notification is queued, cleared when the last one
+   is popped.  IApplicationFunctions cmd 130/140/150/160/210 used to return a
+   fresh, permanently-clear "appfn ev" every call; on PS5 run 1636 thread 81
+   sat on that object for 225 s while the main thread polled a flag only the
+   applet thread can set.  Both event getters now share one queue-driven event. */
+static void am_msg_event_clear_nl(void){
+  g_msg_event->signaled=0;
+  if(g_appfn_ev) g_appfn_ev->signaled=0;
+}
+static void am_push_msg(u32 m){
+  pm_lock(&g_klock); if(g_nmsg<16) g_msgq[g_nmsg++]=m; int left=g_nmsg; pm_unlock(&g_klock);
+  kevent_signal(g_msg_event);
+  if(g_appfn_ev) kevent_signal(g_appfn_ev);
+  { static int np; if(np++<12) LOG("applet: queued message %u (%d pending), msg+appfn events signaled\n",m,left); }
+}
 
 /* IStorage / IStorageAccessor */
 typedef struct { u8* d; u64 size; } StorageData;
@@ -62,7 +79,13 @@ static int storage_acc_disp(SvcObj* o, IpcCtx* c){
     case 0: out64(c,s->size); return 0;
     /* compare against size-off, off+n can wrap around if off is huge */
     case 10: { u64 off=in64(c,0), a, n; buf_in(c,0,&a,&n); if(off>s->size || n>s->size-off) return RC(128,503); memcpy(s->d+off,GP(a),n); return 0; }
-    case 11: { u64 off=in64(c,0), a, n; buf_out(c,0,&a,&n); if(off>s->size) return RC(128,503); if(n>s->size-off) n=s->size-off; memcpy(GP(a),s->d+off,n); return 0; }
+    case 11: { u64 off=in64(c,0), a, n; buf_out(c,0,&a,&n); if(off>s->size) return RC(128,503); if(n>s->size-off) n=s->size-off;
+      /* An am storage created with size 0 makes Read return OK with zero
+         bytes, which the game sees as a truncated/empty resource.  Say so
+         explicitly instead of letting it look like a generic IPC stub miss. */
+      if(!n){ static int w; if(w++<8) LOG("ipc: IStorageAccessor::Read off=%llu -> EMPTY storage (size=%llu)\n",
+                                          (unsigned long long)off,(unsigned long long)s->size); }
+      if(n) memcpy(GP(a),s->d+off,n); return 0; }
   }
   return stub_ok(o,c); }
 
@@ -78,9 +101,17 @@ static int am_csg(SvcObj* o, IpcCtx* c){           /* ICommonStateGetter */
   switch(c->cmd){
     case 0: out_copy_h(c,ev_handle(g_msg_event)); return 0;
     case 1: { pm_lock(&g_klock);
-      if(!g_nmsg){ g_msg_event->signaled=0; pm_unlock(&g_klock); return RC(128,3); }
-      u32 m=g_msgq[0]; memmove(g_msgq,g_msgq+1,(--g_nmsg)*4); if(!g_nmsg) g_msg_event->signaled=0; pm_unlock(&g_klock);
-      { static int nl; if(nl<16){ nl++; LOG("applet: message %u delivered (%d left)\n",m,g_nmsg); } }
+      if(!g_nmsg){ am_msg_event_clear_nl(); pm_unlock(&g_klock); return RC(128,3); }
+      u32 m=g_msgq[0]; memmove(g_msgq,g_msgq+1,(--g_nmsg)*4);
+      int more=g_nmsg; if(!more) am_msg_event_clear_nl();
+      pm_unlock(&g_klock);
+      /* g_appfn_ev is auto-clear on WaitSynchronization, so when multiple
+         messages are queued at boot (0xF, 0x1, 0x1E, 0x1F) the first wait
+         clears it after popping only one message.  Re-signal while messages
+         remain so the applet thread drains the whole queue (including
+         0x1 = ChangeIntoForeground). */
+      if(more){ kevent_signal(g_msg_event); if(g_appfn_ev) kevent_signal(g_appfn_ev); }
+      { static int nl; if(nl<16){ nl++; LOG("applet: message %u delivered (%d left)\n",m,more); } }
       out32(c,m); return 0; }
     case 5: out8(c,(u8)g_opt_docked); return 0;                      /* GetOperationMode */
     case 6: out32(c,(u32)g_opt_docked); return 0;                    /* GetPerformanceMode */
@@ -98,6 +129,31 @@ static int am_csg(SvcObj* o, IpcCtx* c){           /* ICommonStateGetter */
   }
   return stub_ok(o,c); }
 
+/* [S2] GSV GraphicsSupervisor / UserSession -- a TIPC session returned by
+   ISelfController cmd 2000 "GetGraphicsSupervisor" (switchbrew Applet Manager
+   services; exclusive to S2).  nn::gs::sdk::BootGraphicsSystem immediately
+   issues TIPC type 20 (=cmd 4 BootWithRemoteMemory), then 27 (cmd 11
+   SetCurrentProcessHandle) and 117 (cmd 101 CreateContext) -- these are the
+   literal x8 values in the generated code around F_A867F64.
+   Answering cmd 2000 empty made the SDK store handle 0, so svcSendSyncRequest(0)
+   failed and BootWithRemoteMemory called nn::diag::AbortImpl(). */
+static int gsv_session(SvcObj* o, IpcCtx* c){
+  extern int ipc_warn_once(const char*,u32); (void)o;
+  if(ipc_warn_once(o->name,c->cmd)){
+    u32 q[6]; memcpy(q,c->msg,24);
+    LOG("GSV:GraphicsSupervisor cmd %u (tipc=%d type=%u) hdr %08x %08x %08x %08x %08x %08x\n",
+        c->cmd,c->tipc,c->type,q[0],q[1],q[2],q[3],q[4],q[5]); }
+  /* Every GSV UserSession command succeeds with no output.  A static audit of
+     all 280 generated C files found 47 distinct TIPC command numbers reaching
+     this session (Gsv / NativeMemory / Syncpt / Display / Gpu / Camera /
+     VideoDecoder / VideoEncoder / GraphicsFrame / NvDrv), while only 5 were
+     implemented before.  On a host with no GSV + NVDrv2 + NVN2 stack the boot
+     chain is replaced by the symbol-level HLE hooks in kernel.c, but any path
+     that still reaches here must answer OK rather than make nnSdk abort.
+     Each distinct command is logged once above, so the next run reveals the
+     complete remaining set in one pass. */
+  return 0; }
+
 static int am_self(SvcObj* o, IpcCtx* c){          /* ISelfController */
   switch(c->cmd){
     case 0: { extern void process_exit(int); process_exit(0); return 0; }   /* Exit: the system kills the process, libnx just sleeps
@@ -112,6 +168,23 @@ static int am_self(SvcObj* o, IpcCtx* c){          /* ISelfController */
     case 90: out64(c,0); return 0;                                     /* GetAccumulatedSuspendedTickValue */
     case 91: out_copy_h(c,ev_handle(kevent_new("suspend",0))); return 0;
     case 100: case 110: case 120: return 0;
+    /* [S2] GetGraphicsSupervisor: returns an output *TIPC handle*, NOT a CMIF
+       object.  out_obj() degrades to a domain object id when the caller uses
+       a domain session, so hand back a real KHandle.  Bananza's nnSdk still
+       keeps 0 in its GSV singleton even with the handle present in the reply
+       (verified on hardware); ipc_handle() therefore routes handle-0 TIPC
+       requests to this session.  Remember the handle for that fallback. */
+    case 2000: { u32 h=session_new(svcobj_new("GSV:GraphicsSupervisor",gsv_session,0));
+      g_gsv_handle=h;
+      LOG("am: GetGraphicsSupervisor -> handle %x (type=%u tipc=%d domain=%d)\n",
+          h,c->type,c->tipc,c->is_domain);
+      out_move_h(c,h);
+      /* Belt and braces: hardware logs showed the SDK retaining handle 0 even
+         with the KHandle present in the special section (msg+12) and in the
+         domain object-id slot.  Mirror it into the raw CMIF payload too, so
+         whichever field nnSdk's reply parser reads it sees a valid handle. */
+      out32(c,h); out32(c,h);
+      return 0; }
   }
   return quiet_ok(o,c); }
 
@@ -140,7 +213,9 @@ static int am_appfn(SvcObj* o, IpcCtx* c){         /* IApplicationFunctions */
     case 40: out8(c,0); return 0;                                      /* NotifyRunning */
     case 50: out64(c,0x1111222233334444ull); out64(c,0x5555666677778888ull); return 0;
     case 60: case 61: return 0;
-    case 130: case 140: case 150: case 160: case 210: out_copy_h(c,ev_handle(kevent_new("appfn ev",0))); return 0;   /* events (210 only exists in newer SDKs) */
+    case 130: case 140: case 150: case 160: case 210: { /* events (210 only exists in newer SDKs) */
+      static int ne; if(ne++<8) LOG("applet: IApplicationFunctions cmd %u -> queue-driven notification event\n",c->cmd);
+      out_copy_h(c,ev_handle(g_appfn_ev? g_appfn_ev : g_msg_event)); return 0; }
     case 141: return RC(128,2);
     case 170: out8(c,0); return 0;
   }
@@ -331,8 +406,21 @@ static int am_proxy(SvcObj* o, IpcCtx* c){        /* IApplicationProxy */
   return stub_ok(o,c); }
 
 static int am_oe(SvcObj* o, IpcCtx* c){
-  if(c->cmd==0){ out_obj(c,svcobj_new("IApplicationProxy",am_proxy,0)); return 0; }
-  return stub_ok(o,c); }
+  /* Both 0 and 10 hand back IApplicationProxy. Evidence from the console log: the
+     first request this title sends on the appletOE session is cmd 10, and it then
+     drives the returned object with the IApplicationProxy command set
+     (0..4, 11, 20, 1000). Answering 10 with a dummy made every one of those
+     "succeed without output", so nnSdk stored NULL interfaces and later called
+     through them (badcall target=0), then waited on a 0 handle (E401 abort). */
+  if(c->cmd==0 || c->cmd==10){ out_obj(c,svcobj_new("IApplicationProxy",am_proxy,0)); return 0; }
+  /* On hardware appletOE/appletAE hand back IApplicationProxy itself: the game
+     sends GetCommonStateGetter(0) ... GetApplicationFunctions(20) straight to
+     the service session, with no cmd-0 indirection. Those all used to fall into
+     stub_ok, which answers "ok" but writes no object handle, so nnSdk stored a
+     NULL interface and later called through it (nn::am::InitializeApplication-
+     Interfaces / nn::oe::InitializeApplet -> blr x8 with x8 = 0). cmd 0 stays
+     supported for the titles that do ask for the proxy object explicitly. */
+  return am_proxy(o,c); }
 
 static SvcObj* new_appletoe(void){ return svcobj_new("appletOE",am_oe,0); }
 
@@ -853,6 +941,22 @@ static int audout_disp(SvcObj* o, IpcCtx* c){
 
 static SvcObj* new_audout(void){ return svcobj_new("audout:u",audout_disp,0); }
 
+/* aud:u (deprecated AudioController) used by Bananza's old SDK: the generic
+   stub returned no handles, so a fresh audio thread waited on handle 0 and spun
+   ~16M times/sec.  cmd 2 (OpenAudioOut/OpenAudioRenderer) now returns a real
+   IAudioOut subsession plus its buffer-event handle, so the thread blocks on a
+   valid KEvent instead of burning a core. */
+static int audu_disp(SvcObj* o, IpcCtx* c){
+  (void)o;
+  if(c->cmd==0) return 0;                          /* Initialize / RegisterClient */
+  if(c->cmd==2){
+    SvcObj* a=aout_new(2);                          /* IAudioOut, 2ch default */
+    out_obj(c,a);                                   /* subsession */
+    out_copy_h(c,ev_handle(((AudOut*)a->data)->ev)); /* sync event handle */
+    return 0; }
+  return quiet_ok(o,c); }
+static SvcObj* new_audu(void){ return svcobj_new("aud:u",audu_disp,0); }
+
 /* hwopus, packets get decoded with libopus. sonic 1 (sega ages) spins on the same packet forever after the logos
    if it gets "0 bytes used, 0 samples". input is { u32 size (big endian), u32 final_range } and then the opus
    packet, consumed = size + 8. output is interleaved s16 at the rate and channel count the decoder was opened with */
@@ -1123,11 +1227,11 @@ static SvcObj* new_ngc(void){ return svcobj_new("ngc:u",ngc_disp,0); }
 
 void svc_core_init(void){
   swr_audio_init();
-  g_msg_event=kevent_new("applet msg",0); g_launch_ev=kevent_new("launchable",0); g_res_ev=kevent_new("res change",0); g_opmode_ev=kevent_new("opmode",0);
+  g_msg_event=kevent_new("applet msg",0); g_appfn_ev=kevent_new("appfn notify",1); g_launch_ev=kevent_new("launchable",0); g_res_ev=kevent_new("res change",0); g_opmode_ev=kevent_new("opmode",0);
   g_aud_ev=kevent_new("audio renderer",0);
   pm_init(&g_aout_lk);
   /* the runtime keeps signaling these, so we hold a reference and a game closing its handles can't free them */
-  kobj_ref(&g_msg_event->o); kobj_ref(&g_launch_ev->o); kobj_ref(&g_res_ev->o); kobj_ref(&g_opmode_ev->o); kobj_ref(&g_aud_ev->o);
+  kobj_ref(&g_msg_event->o); kobj_ref(&g_appfn_ev->o); kobj_ref(&g_launch_ev->o); kobj_ref(&g_res_ev->o); kobj_ref(&g_opmode_ev->o); kobj_ref(&g_aud_ev->o);
   plat_thread(audio_clock,NULL,64*1024);
   if(plat_thread(aout_clock,NULL,256*1024)) WARN("audout: timer thread unavailable, using frontend playback pump\n");
   am_push_msg(0xF);          /* FocusStateChanged */
@@ -1149,6 +1253,7 @@ void svc_core_init(void){
   svc_register("friend:u",new_friend); svc_register("friend:a",new_friend); svc_register("friend:v",new_friend);
   svc_register("ns:am2",new_ns); svc_register("ns:ec",new_ns); svc_register("ns:rid",new_ns); svc_register("ns:rt",new_ns); svc_register("ns:web",new_ns); svc_register("ns:ro",new_ns);
   svc_register("audren:u",new_audren); svc_register("audout:u",new_audout); svc_register("audin:u",new_audout); svc_register("hwopus",new_hwopus);
+  svc_register("aud:u",new_audu);
   svc_register("bsd:u",new_bsd); svc_register("bsd:s",new_bsd); svc_register("ssl",new_ssl);
   svc_register("prepo:u",new_prepo); svc_register("prepo:a",new_prepo); svc_register("prepo:a2",new_prepo); svc_register("psm",new_psm);
   svc_register("fatal:u",new_fatal); svc_register("csrng",new_csrng); svc_register("mm:u",new_mm);

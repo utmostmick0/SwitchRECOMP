@@ -21,7 +21,7 @@ Output (next to the executable):
 
 LEGAL: does not include or download games, keys or firmware. Bring a legally owned copy.
 """
-import argparse, os, sys, shutil, subprocess, time, hashlib, filecmp, re, struct, threading
+import argparse, os, sys, shutil, subprocess, time, hashlib, filecmp, re, struct, threading, json
 from concurrent.futures import ThreadPoolExecutor
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -35,6 +35,24 @@ ABI = 1
 # portable compilers next to us: tcc\, the GCC package (gcc\), w64devkit
 CC_DIRS = [os.path.join(HERE, *d) for d in (('tcc',), ('tools', 'tcc'), ('gcc', 'bin'), ('gcc', 'Library', 'bin'),
                                              ('w64devkit', 'bin'))]
+# PS5 (OrbisOS) cross build. The SDK wrappers need a host llvm-config to find the
+# real clang/lld/ar; that path is injected via LLVM_CONFIG (see ps5_env()).
+DEFAULT_PS5_SDK = os.environ.get('SWR_PS5_SDK', '/data/code/EglantinePS5-build56/.deps/lapy-ps5-payload-sdk-v0.42')
+DEFAULT_LLVM_CONFIG = os.environ.get('SWR_LLVM_CONFIG', '/data/toolchains/llvm-23.1.4/bin/llvm-config')
+PS5_BUILD_TOOL = os.path.join(HERE, 'tools', 'ps5', 'ps5build.py')
+
+
+def ps5_env(sdk=DEFAULT_PS5_SDK, llvm_config=DEFAULT_LLVM_CONFIG):
+    """Environment for every prospero-* wrapper invocation."""
+    if not os.path.isfile(os.path.join(sdk, 'bin', 'prospero-clang')):
+        raise SystemExit('PS5 SDK not found: %s (set SWR_PS5_SDK)' % sdk)
+    if not os.path.isfile(llvm_config):
+        raise SystemExit('llvm-config not found: %s (set SWR_LLVM_CONFIG). '
+                         'The SDK wrappers are only scripts and need a host LLVM toolchain.' % llvm_config)
+    os.environ['PS5_PAYLOAD_SDK'] = sdk
+    os.environ['LLVM_CONFIG'] = llvm_config
+    os.environ['PATH'] = os.path.join(sdk, 'bin') + os.pathsep + os.environ.get('PATH', '')
+    return os.path.join(sdk, 'bin', 'prospero-clang')
 
 
 def find_cc(pref=None, target_win=False):
@@ -94,7 +112,7 @@ def write_if_changed(p, text):
     return True
 
 
-def gen_module(prog, mods, npdm, outdir, title, chunk_instrs, say):
+def gen_module(prog, mods, npdm, outdir, title, chunk_instrs, say, static_link=False):
     funcs = prog.funcs
     order = sorted(funcs)
     # split by instruction count
@@ -125,7 +143,11 @@ def gen_module(prog, mods, npdm, outdir, title, chunk_instrs, say):
     L = ['#include "cpu.h"', '#include "cpu_helpers.c"']
     L += ['void %s(CPU* RESTRICT c, u64 e);' % n for n in names]
     L.append(codegen.gen_interp(step_mode=False))
-    L.append('GuestFn swr_interp_entry;')
+    # cpu.h already declares this extern. In a -shared .so the tentative
+    # definition is harmless, but a static PS5 link also contains main.c's
+    # definition and lld reports a duplicate symbol.
+    if not static_link:
+        L.append('GuestFn swr_interp_entry;')
     L.append('static const GuestFn FNS[%d]={%s};' % (max(1, len(names)), ','.join(names) or '0'))
     L.append('static const u32 ENT_OFF[%d]={%s};' % (max(1, len(ents)), ','.join('%d' % (a - nxloader.CODE_BASE) for a, _ in ents) or '0'))
     L.append('static const u32 ENT_FN[%d]={%s};' % (max(1, len(ents)), ','.join(str(idx[n]) for _, n in ents) or '0'))
@@ -152,6 +174,12 @@ def gen_module(prog, mods, npdm, outdir, title, chunk_instrs, say):
     L.append(' MOD.abi=%d; MOD.nmods=%d; MOD.mods=MODS; MOD.nentries=%d; MOD.entry_addr=ENT_ADDR; MOD.entry_fn=ENT_PTR; MOD.interp=swr_interp;' % (ABI, len(mods), len(ents)))
     L.append(' MOD.code_lo=0x%XULL; MOD.code_hi=0x%XULL; MOD.title="%s"; MOD.title_id=0x%XULL;' % (lo, hi, title.replace('"', ''), np_['title_id']))
     L.append(' MOD.main_stack=%d; MOD.main_prio=%d; MOD.main_core=%d; MOD.init=mod_init; return &MOD; }' % (np_['stack'], np_['prio'], np_['core']))
+    if static_link:
+        # runtime/main.c declares this symbol weak and prefers it over dlopen().
+        # A weak *undefined* reference does NOT pull a member out of a static
+        # archive, so ps5build.py links module.o directly and forces -u as well.
+        L.append('/* --target ps5: strong definition overriding main.c\'s weak hook, no dlopen */')
+        L.append('SWR_EXPORT const SwrModule* swr_module_static(void){ return swr_module(); }')
     p = os.path.join(outdir, 'module.c')
     write_if_changed(p, '\n'.join(L) + '\n')
     files.insert(0, p)
@@ -159,7 +187,7 @@ def gen_module(prog, mods, npdm, outdir, title, chunk_instrs, say):
     return files
 
 
-def compile_all(files, cc, opt, outdir, target_win, jobs, say, extra_flags=()):
+def compile_all(files, cc, opt, outdir, target_win, jobs, say, extra_flags=(), target_ps5=False):
     objs = []
     base = [cc]
     if is_tcc(cc):
@@ -167,6 +195,10 @@ def compile_all(files, cc, opt, outdir, target_win, jobs, say, extra_flags=()):
     else:
         flags = ['-O' + opt, '-fno-strict-aliasing', '-fwrapv', '-w', '-I', RT, '-foptimize-sibling-calls', '-fno-semantic-interposition']
         if not target_win: flags += ['-fPIC', '-fvisibility=hidden']
+        if target_ps5:
+            # PS5 .text is execute-only: jump tables put literal data in .text,
+            # so keep switch dispatch as compare chains instead.
+            flags += ['-fno-jump-tables', '-DSWR_PS5', '-DSWR_NO_H264', '-DSWR_NO_OPUS']
         flags += list(extra_flags)
     t0 = time.time()
     done = [0]; lock = threading.Lock()
@@ -204,7 +236,7 @@ def compile_all(files, cc, opt, outdir, target_win, jobs, say, extra_flags=()):
     return objs
 
 
-def link_module(objs, cc, out, target_win, say):
+def link_module(objs, cc, out, target_win, say, target_ps5=False, sdk=None):
     # big games have hundreds of objects and windows caps command lines at ~32K, so use an @rsp file
     # (gcc and tcc both take it) with short relative names
     bdir = os.path.dirname(os.path.abspath(objs[0])) if objs else '.'
@@ -213,6 +245,18 @@ def link_module(objs, cc, out, target_win, say):
     with open(rsp, 'w') as fo:
         fo.write('\n'.join('"%s"' % n for n in names) + '\n')
     out = os.path.abspath(out)
+    if target_ps5:
+        # No -shared .so on OrbisOS: the game code becomes a static archive that
+        # is linked into the same eboot.bin as the runtime.
+        ar = os.path.join(sdk, 'bin', 'prospero-ar') if sdk else 'ar'
+        arc = os.path.join(bdir, 'libgame_code.a')
+        if os.path.isfile(arc): os.remove(arc)
+        err = run_cc([ar, 'rcs', os.path.basename(arc), '@objects.rsp'], ar, cwd=bdir)
+        if err:   # older llvm-ar builds do not expand @rsp
+            err = run_cc([ar, 'rcs', os.path.basename(arc)] + names, ar, cwd=bdir)
+        if err: raise SystemExit('Creating libgame_code.a failed:\n' + err[-4000:])
+        say('Static archive: %s (%d objects)' % (arc, len(objs)))
+        return arc
     if os.path.isfile(cc): cc = os.path.abspath(cc)
     if is_tcc(cc):
         cmd = [cc, '-shared', '-o', out] + tcc_b(cc) + ['@objects.rsp']
@@ -413,8 +457,15 @@ def main():
     ap.add_argument('-O', default='2', help='optimization level (0-3)')
     ap.add_argument('--jobs', type=int, default=os.cpu_count() or 4)
     ap.add_argument('--chunk', type=int, default=30000, help='instructions per C file')
-    ap.add_argument('--target', choices=['auto', 'win64', 'linux'], default='auto')
-    ap.add_argument('--backend', choices=['auto', 'win32', 'x11', 'headless'], default='auto')
+    ap.add_argument('--target', choices=['auto', 'win64', 'linux', 'ps5'], default='auto')
+    ap.add_argument('--backend', choices=['auto', 'win32', 'x11', 'headless', 'ps5'], default='auto')
+    ap.add_argument('--ps5-sdk', default=DEFAULT_PS5_SDK, help='ps5-payload-sdk root')
+    ap.add_argument('--llvm-config', default=DEFAULT_LLVM_CONFIG, help='host llvm-config for the prospero wrappers')
+    ap.add_argument('--ps5-boilerplate', default='/data/code/ps5-native-app-boilerplate')
+    ap.add_argument('--ps5-title-id', default='PPSA99201', help='PPSAxxxxx folder / param.json titleId')
+    ap.add_argument('--ps5-display-title', default='',
+                    help='user-facing titleName in param.json (defaults to the -o build name)')
+    ap.add_argument('--ps5-no-package', action='store_true', help='stop after libgame_code.a + manifest (no link/sign)')
     ap.add_argument('--native', action='store_true', help='optimize for THIS processor (-march=native)')
     ap.add_argument('--no-build', action='store_true', help='only generate the C code and copy the game data')
     ap.add_argument('--keep-c', action='store_true', help=argparse.SUPPRESS)   # the C is always kept, for rebuilds
@@ -424,9 +475,24 @@ def main():
     ap.add_argument('-q', '--quiet', action='store_true')
     a = ap.parse_args()
     say = (lambda m: None) if a.quiet else (lambda m: print(m, flush=True))
+    target_ps5 = a.target == 'ps5'
     target_win = a.target == 'win64' or (a.target == 'auto' and sys.platform.startswith('win'))
-    backend = a.backend if a.backend != 'auto' else ('win32' if target_win else 'x11')
+    backend = a.backend if a.backend != 'auto' else ('ps5' if target_ps5 else 'win32' if target_win else 'x11')
+    if target_ps5 and backend in ('win32', 'x11'):
+        ap.error('--target ps5 needs --backend ps5 or headless (no WGL/GLX on OrbisOS)')
+    if target_ps5 and not a.no_build:
+        ps5_cc = ps5_env(a.ps5_sdk, a.llvm_config)
+    else:
+        ps5_cc = None
     if a.build_runtime:
+        if target_ps5:
+            # a reusable PS5 runtime archive; tools/ps5/ps5build.py does the work
+            argv = [sys.executable, PS5_BUILD_TOOL, '--runtime-only', '--repo', HERE,
+                    '--sdk', a.ps5_sdk, '--llvm-config', a.llvm_config,
+                    '--boilerplate', a.ps5_boilerplate, '--backend', backend,
+                    '--opt', a.O, '--jobs', str(a.jobs), '--outdir', os.path.join(HERE, 'bin')]
+            r = subprocess.run(argv)
+            raise SystemExit(r.returncode)
         cc = find_cc(a.cc, target_win)
         if not cc: raise SystemExit('C compiler not found: %s' % (a.cc or 'gcc'))
         out = runtime_path(target_win, backend)
@@ -440,7 +506,7 @@ def main():
     # check the compiler first, not after minutes of translation
     cc = None
     if not a.no_build:
-        cc = find_cc(a.cc, target_win)
+        cc = ps5_cc if target_ps5 else find_cc(a.cc, target_win)
         if not cc: raise SystemExit('C compiler not found: %s' % a.cc if a.cc else 'No C compiler found (gcc, clang or tcc).')
     say('SwitchRecomp - bring a legally owned copy of the game. No games or keys included.')
     try:
@@ -458,8 +524,9 @@ def main():
     outdir = os.path.abspath(a.outdir or os.getcwd())
     os.makedirs(outdir, exist_ok=True)
     base = os.path.join(outdir, title)
-    exe = base + ('.exe' if target_win else '')
-    modout = base + ('_code.dll' if target_win else '_code.so')
+    appdir = os.path.join(outdir, a.ps5_title_id) if target_ps5 else ''
+    exe = os.path.join(appdir, 'eboot.bin') if target_ps5 else base + ('.exe' if target_win else '')
+    modout = os.path.join(base + '_build', 'libgame_code.a') if target_ps5 else base + ('_code.dll' if target_win else '_code.so')
 
     if not a.no_build: check_writable(exe, modout)
     hints = []
@@ -479,7 +546,7 @@ def main():
     build = base + '_build'
     os.makedirs(build, exist_ok=True)
     say('Translating ARM64 to C...')
-    files = gen_module(prog, mods, npdm, build, title, a.chunk, say)
+    files = gen_module(prog, mods, npdm, build, title, a.chunk, say, static_link=target_ps5)
     datadir = base + '_data'
     copy_data(mods, npdm, romfs, a.input, datadir, say)
     if not os.path.exists(base + '.ini'):
@@ -489,9 +556,32 @@ def main():
     extra = []
     if a.native and not is_tcc(cc): extra.append('-march=native')
     if os.environ.get('SWR_CFLAGS') and not is_tcc(cc): extra += os.environ['SWR_CFLAGS'].split()   # e.g. -march for someone else's cpu
-    objs = compile_all(files, cc, a.O, build, target_win, a.jobs, say, extra)
+    objs = compile_all(files, cc, a.O, build, target_win, a.jobs, say, extra, target_ps5=target_ps5)
     say('Linking %s ...' % os.path.basename(modout))
-    link_module(objs, cc, modout, target_win, say)
+    link_module(objs, cc, modout, target_win, say, target_ps5=target_ps5, sdk=a.ps5_sdk)
+    if target_ps5:
+        # A weak undefined reference does not pull a member out of an archive, so
+        # hand ps5build.py module.o explicitly (plus a -u force symbol).
+        modobj = next((o for o in objs if os.path.basename(o).startswith('module.') and o.endswith('.o')), None)
+        manifest = dict(title=title, title_id='%016X' % info['title_id'], ps5_title_id=a.ps5_title_id,
+                        display_title=a.ps5_display_title or '',
+                        repo=HERE, build=build, datadir=datadir, appdir=appdir,
+                        archive=modout, module_obj=modobj,
+                        objects_rsp=os.path.join(build, 'objects.rsp'),
+                        backend=backend, opt=a.O, jobs=a.jobs, cc=cc,
+                        sdk=a.ps5_sdk, llvm_config=a.llvm_config,
+                        boilerplate=a.ps5_boilerplate, interp_only=a.interp_only)
+        mp = os.path.join(build, 'ps5_build_manifest.json')
+        with open(mp, 'w', encoding='utf-8') as fo: json.dump(manifest, fo, indent=2)
+        say('PS5 build manifest: %s' % mp)
+        if a.ps5_no_package:
+            say('Done (static archive only): %s' % modout)
+            return
+        argv = [sys.executable, PS5_BUILD_TOOL, '--manifest', mp]
+        r = subprocess.run(argv)
+        if r.returncode: raise SystemExit('PS5 packaging failed (see ps5build log), rc=%d' % r.returncode)
+        say('Done: %s' % exe)
+        return
     if a.runtime:
         shutil.copyfile(a.runtime, exe)
     else:

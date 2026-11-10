@@ -246,6 +246,109 @@ u32 swr_cas128(u64* p, u64 o0, u64 o1, u64 n0, u64 n1){
 }
 #endif
 
+/* ---- ARMv8.1 LSE atomic memory operations ----
+   Switch 2 / system 22+ games use these instead of LDXR/STXR loops. One CAS
+   loop covers every variant: no suffix, A (acquire), L (release) and AL, for
+   byte/halfword/word/dword. Sequentially-consistent CAS is a safe superset of
+   the acquire/release orderings, and the host (x86_64) cannot observe the
+   difference in guest-visible behaviour. swr_cas* are already defined for both
+   gcc/clang and tcc above. */
+static u64 swr_lse_sext(u64 x, int size){
+  switch(size){ case 0: return (u64)(i64)(i8)x; case 1: return (u64)(i64)(i16)x;
+                case 2: return (u64)(i64)(i32)x; default: return x; }
+}
+static u64 swr_lse_apply(u64 o, u64 v, int op, int size){
+  switch(op){
+    case 0: return o+v;                                                        /* LDADD */
+    case 1: return o&~v;                                                       /* LDCLR */
+    case 2: return o^v;                                                        /* LDEOR */
+    case 3: return o|v;                                                        /* LDSET */
+    case 4: return (u64)((i64)swr_lse_sext(o,size)>(i64)swr_lse_sext(v,size)?o:v);  /* LDSMAX */
+    case 5: return (u64)((i64)swr_lse_sext(o,size)<(i64)swr_lse_sext(v,size)?o:v);  /* LDSMIN */
+    case 6: return o>v?o:v;                                                    /* LDUMax */
+    case 7: return o<v?o:v;                                                    /* LDUMin */
+    default: return v;                                                         /* SWP */
+  }
+}
+#define SWR_LSE_CASE(T, CASFN) do { \
+    T* p_=(T*)(M+a); T o_=*(volatile T*)p_, n_; \
+    for(;;){ n_=(T)swr_lse_apply(o_,v,op,size); \
+             if(CASFN(p_,o_,n_)) return (u64)o_; \
+             o_=*(volatile T*)p_; } \
+  } while(0)
+u64 swr_lse(u8* M, u64 a, u64 v, int size, int op){
+  static const u64 lse_mask_[4]={0xFFull,0xFFFFull,0xFFFFFFFFull,0xFFFFFFFFFFFFFFFFull};
+  size &= 3; v &= lse_mask_[size];
+  switch(size){
+    case 0: SWR_LSE_CASE(u8,  swr_cas8);
+    case 1: SWR_LSE_CASE(u16, swr_cas16);
+    case 2: SWR_LSE_CASE(u32, swr_cas32);
+    default: SWR_LSE_CASE(u64, swr_cas64);
+  }
+  return 0;
+}
+#undef SWR_LSE_CASE
+
+/* ---- ARMv8.1 LSE CAS / CASP ---------------------------------------------
+   The LDSTX encodings with o2=1,o1=1 are CAS/CASA/CASL/CASAL and the ones
+   with o2=0,o1=1,size<2 are CASP/CASPA/CASPL/CASPAL. Both used to be emitted
+   as c->rt->undef() and killed the guest the first time a Nintendo SDK
+   critical section was entered (nn::os::detail::InternalCriticalSection...).
+   Unlike swr_lse(), CAS must write the loaded value back into Rs, so these
+   helpers take CPU* plus register *indices* rather than register values.
+   Reuse the swr_casN primitives (defined for gcc/clang and tcc above), which
+   also avoids any libatomic dependency in the FSELF link. */
+static u64 swr_cas_loaded(u8* M, u64 a, int size, u64 expect, u64 newv){
+  static const u64 m_[4]={0xFFull,0xFFFFull,0xFFFFFFFFull,0xFFFFFFFFFFFFFFFFull};
+  expect &= m_[size&3]; newv &= m_[size&3];
+#define SWR_CAS_CASE(T, CASFN) do { \
+    T* p_=(T*)(M+a); T o_; \
+    for(;;){ o_=*(volatile T*)p_; \
+             if((u64)o_!=expect) return (u64)o_; \
+             if(CASFN(p_,o_,(T)newv)) return (u64)o_; } \
+  } while(0)
+  switch(size&3){
+    case 0: SWR_CAS_CASE(u8,  swr_cas8);
+    case 1: SWR_CAS_CASE(u16, swr_cas16);
+    case 2: SWR_CAS_CASE(u32, swr_cas32);
+    default:SWR_CAS_CASE(u64, swr_cas64);
+  }
+#undef SWR_CAS_CASE
+  return 0;
+}
+
+void swr_cas(CPU* c, u8* M, u64 a, int rs, int rt, int size){
+  u64 e = rs==31? 0 : c->x[rs];
+  u64 n = rt==31? 0 : c->x[rt];
+  u64 o = swr_cas_loaded(M,a,size,e,n);   /* zero-extended for size < 3 */
+  if(rs!=31) c->x[rs]=o;
+}
+
+void swr_casp(CPU* c, u8* M, u64 a, int rs, int rt, int size){
+  int r1=(rs+1)&31, t1=(rt+1)&31;
+  u64 o0=rs==31?0:c->x[rs], o1=r1==31?0:c->x[r1];
+  u64 n0=rt==31?0:c->x[rt], n1=t1==31?0:c->x[t1];
+  u64* p=(u64*)(M+a);
+  if(size&1){
+    /* two X registers: 16-byte atomic CAS. swr_cas128 does not report the
+       loaded pair, so reload on failure; the pair only changes on success. */
+    for(;;){
+      u64 c0=*(volatile u64*)&p[0], c1=*(volatile u64*)&p[1];
+      if(c0!=o0 || c1!=o1){ o0=c0; o1=c1; break; }
+      if(swr_cas128(p,c0,c1,n0,n1)) break;
+    }
+  } else {
+    /* two W registers: one 8-byte CAS. swr_cas_loaded returns the pair it
+       observed, which is exactly what Rs/Rs+1 must receive. */
+    u64 e=((u64)(u32)o0)|((u64)(u32)o1<<32);
+    u64 n=((u64)(u32)n0)|((u64)(u32)n1<<32);
+    u64 o=swr_cas_loaded(M,a,3,e,n);
+    o0=(u32)o; o1=(u32)(o>>32);
+  }
+  if(rs!=31) c->x[rs]=o0;
+  if(r1!=31) c->x[r1]=o1;
+}
+
 /* ================================================================ system */
 #define SYSREG(op0,op1,crn,crm,op2) ((((op0)&1)<<14)|((op1)<<11)|((crn)<<7)|((crm)<<3)|(op2))
 
@@ -895,6 +998,35 @@ static int simd_ldst(CPU* c, u8* M, u32 w){
 }
 
 /* ---- dispatcher for anything AdvSIMD / crypto ---- */
+/* SDOT / UDOT (FEAT_DotProd), vector and by-element.  Each 32-bit lane of Vd
+   accumulates the sum of four 8-bit products of the matching bytes of Vn and Vm
+   (Vm lane `index` for the by-element form).  Mirrors Hookshot's nx2/insn.py dot()
+   (OoT SDK 22.2.8 has 4 such sites); suyu's translator also lacks this form, so
+   games built on the SDK 22 dot-product helpers would otherwise leave these
+   functions untranslated.  Q=0 zeroes the upper 64 bits of the 128-bit result, as
+   the architecture specifies. */
+static int simd_dot(CPU* c, u32 w){
+  int q=(w>>30)&1, u=(w>>29)&1, rm=(w>>16)&31, rn=(w>>5)&31, rd=w&31;
+  int elem=(w>>24)&1;
+  V128 n=*VR(rn), m=*VR(rm), d=*VR(rd);
+  int lanes=q? 4:2;
+  int midx0 = elem ? (4*(((w>>11)&1)<<1 | ((w>>21)&1))) : 0;
+  for(int i=0;i<lanes;i++){
+    int32_t s=0;
+    for(int j=0;j<4;j++){
+      int nidx=4*i+j;
+      int midx = elem ? midx0+j : 4*i+j;
+      int32_t a = u ? (int32_t)(u8)n.b[nidx] : (int32_t)(i8)n.b[nidx];
+      int32_t b = u ? (int32_t)(u8)m.b[midx] : (int32_t)(i8)m.b[midx];
+      s += a*b;
+    }
+    d.s[i] = (u32)((i32)d.s[i] + s);
+  }
+  if(!q){ d.s[2]=0; d.s[3]=0; }
+  *VR(rd)=d;
+  return 1;
+}
+
 int swr_simd(CPU* c, u8* M, u32 w){
   if((w&0xBF800000u)==0x0C000000u || (w&0xBF800000u)==0x0C800000u || (w&0xBF000000u)==0x0D000000u) return simd_ldst(c,M,w);
   if((w&0x9F200400u)==0x0E200400u) return simd_3same(c,w,0);
@@ -930,5 +1062,9 @@ int swr_simd(CPU* c, u8* M, u32 w){
     if(op<=3){ v_sha1(c,op,rd,rn,rm); return 1; } if(op<=6){ v_sha256(c,op,rd,rn,rm); return 1; } return 0; }
   if((w&0xFFFF0C00u)==0x5E280800u){ int op=(w>>12)&31, rn=(w>>5)&31, rd=w&31;
     if(op==0){ v_sha1(c,0x10,rd,rn,0); return 1; } if(op==1){ v_sha1(c,0x11,rd,rn,0); return 1; } if(op==2){ v_sha256(c,0x12,rd,rn,0); return 1; } return 0; }
+  /* SDOT / UDOT (vector + by element), FEAT_DotProd.  Must come after the
+     generic 3same/3diff branches because the masks are a strict subset of theirs
+     only for the dot opcodes; placed last so nothing else claims these. */
+  if((w&0x9FE0FC00u)==0x0E809400u || (w&0x9FC0F400u)==0x0F80E000u) return simd_dot(c,w);
   return 0;
 }

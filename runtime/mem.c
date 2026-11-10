@@ -20,7 +20,34 @@ void mem_init(void){
   if(!g_mem) fatal("Could not reserve %llu GB of virtual memory for the game.", (unsigned long long)(AS_SIZE>>30));
   /* page 0 is mapped and zeroed so a NULL(+off) read gives 0 instead of a crash */
   plat_vm_commit(g_mem,0x10000);
+#ifdef SWR_PS5
+  /* shared read-only zero page for unbound GPU sparse ranges (avoids fatal GPU faults) */
+  if(mem_zero_page_init()!=0) WARN("mem: zero page init failed; unbound sparse ranges may fault\n");
+  { u32 u,l,w; plat_ps5_pt_stats(&u,&l,&w);
+    LOG("mem: PS5 page-table budget ready: used=%u watermark=%u limit=%u\n",u,w,l); }
+#endif
 }
+
+#ifdef SWR_PS5
+/* Try to bring page-table usage down to the watermark. Stage 1 (this change):
+   empty granules are already returned by plat_vm_decommit, so this only reports
+   status. Stage 2 (P1) will LZ4-compact cold granules before munmap.
+   Returns 0 when at/below target, -1 when it cannot satisfy the target. */
+int mem_reclaim_pt(u32 target_watermark){
+  u32 used, limit, wm;
+  plat_ps5_pt_stats(&used,&limit,&wm);
+  if(used<=target_watermark){
+    LOG("mem: reclaim target already met used=%u target=%u\n",used,target_watermark);
+    return 0;
+  }
+  /* P1 hook: cold-page scanner will select LRU granules, LZ4-pack them, then
+     munmap. Not available yet; report so the caller can decide. */
+  LOG("mem: reclaim cannot reduce used=%u below target=%u (cold compaction not yet wired)\n",
+      used,target_watermark);
+  (void)limit;(void)wm;
+  return -1;
+}
+#endif
 
 static void ins_at(int i, MemBlock b){
   if(nblk==capblk){ capblk=capblk? capblk*2 : 256; blk=realloc(blk,sizeof(MemBlock)*capblk); }

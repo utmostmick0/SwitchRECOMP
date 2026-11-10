@@ -29,6 +29,13 @@ static u64 g_next_tid = 0x50;
 typedef struct { u32 imm, res; u64 lr, a[4], o1; } SvcRec;
 
 static SvcRec g_svc_ring[64]; static u32 g_svc_ring_n;
+/* how often each SVC id was used -- dumped on abort so one run shows which
+   kernel services this title actually depends on */
+static u32 g_svc_n[256];
+static void svc_dump_census(void){
+  LOG("svc: kernel service census\n");
+  for(int i=0;i<256;i++) if(g_svc_n[i]) LOG("  svc 0x%02x x%u\n",(u32)i,g_svc_n[i]);
+}
 
 /* ============================================================ handles */
 #define MAXH 4096
@@ -130,7 +137,15 @@ static void thread_body(void* p){
 
 void kthread_start(KThread* t){
   t->state=1;
-  if(plat_thread(thread_body,t,(size_t)64<<20)) fatal("could not create a system thread");
+#if defined(__PROSPERO__) || defined(__ORBIS__)
+  /* PS5's host thread-stack region is small; 4 MiB is plenty for recompiled
+     guest code, and keeps the 16-40 guest threads a game spawns from exhausting
+     it (a 64 MiB request here is what the doc flags as root cause 5). */
+  size_t stack_sz = (size_t)4 << 20;
+#else
+  size_t stack_sz = (size_t)64 << 20;
+#endif
+  if(plat_thread(thread_body,t,stack_sz)) fatal("could not create a system thread (see the 'thread: try=' diagnostics above)");
 }
 
 void svc_exit_thread(KThread* t){
@@ -298,7 +313,7 @@ static void arb_note(u8 op, KThread* t, u64 addr, u32 type, i32 value, i64 arg, 
   r->op=op; r->tid= t? t->id : 0; r->addr=addr; r->lr= t? t->cpu.x[30] : 0; r->type=type; r->value=value; r->arg=arg; r->res=res;
   r->before=before; r->after= (addr&3)? 0 : (i32)gr32(addr); r->waiters=(u8)(waiters>255? 255 : waiters); pm_unlock(&g_arb_lk); }
 
-static u32 svc_wait_addr(KThread* t, u64 addr, u32 type, i32 value, i64 timeout){
+static u32 svc_wait_addr(KThread* t, u64 addr, u32 type, u64 value, i64 timeout){
   if(addr&3) return R_BADADDR;
   pm_lock(&g_klock);
   i32* p=(i32*)GP(addr);
@@ -308,6 +323,7 @@ static u32 svc_wait_addr(KThread* t, u64 addr, u32 type, i32 value, i64 timeout)
     case 1: for(;;){ if(cur>=value){ pm_unlock(&g_klock); return R_BADSTATE; }
               if(__atomic_compare_exchange_n(p,&cur,cur-1,0,__ATOMIC_SEQ_CST,__ATOMIC_SEQ_CST)) break; } break;
     case 2: if(cur!=value){ pm_unlock(&g_klock); return R_BADSTATE; } break;
+    case 3: { u64 cur64=*(u64*)GP(addr); if(cur64!=(u64)value){ pm_unlock(&g_klock); return R_BADSTATE; } break; } /* WaitIfEqual64 (21.0+) */
     default: pm_unlock(&g_klock); return R_BADENUM;
   }
   if(timeout==0){ pm_unlock(&g_klock); return R_TIMEOUT; }
@@ -321,7 +337,7 @@ static u32 svc_wait_addr(KThread* t, u64 addr, u32 type, i32 value, i64 timeout)
 static void wake_addr_nl(u64 addr, i32 count){
   int n=0; while(count<=0 || n<count){ KThread* w=wl_best(4,addr); if(!w) break; wl_del(w); w->wait_kind=0; wake(w,0); n++; } }
 
-static u32 svc_signal_addr(u64 addr, u32 type, i32 value, i32 count){
+static u32 svc_signal_addr(u64 addr, u32 type, u64 value, i32 count){
   if(addr&3) return R_BADADDR;
   { static int said[3]; if(type<3 && !said[type]){ said[type]=1; LOG("kernel: SignalToAddress type %u in use\n",type); } }
   pm_lock(&g_klock);
@@ -338,6 +354,9 @@ static u32 svc_signal_addr(u64 addr, u32 type, i32 value, i32 count){
     i32 exp=value;
     if(nv!=value){ if(!__atomic_compare_exchange_n(p,&exp,nv,0,__ATOMIC_SEQ_CST,__ATOMIC_SEQ_CST)){ pm_unlock(&g_klock); return R_BADSTATE; } }
     else if(__atomic_load_n(p,__ATOMIC_SEQ_CST)!=value){ pm_unlock(&g_klock); return R_BADSTATE; }
+  } else if(type==3){
+    /* SignalIfEqual64 (21.0+): signal only when the 64-bit word matches. */
+    if(*(u64*)GP(addr)!=(u64)value){ pm_unlock(&g_klock); return 0; }
   } else if(type!=0){ pm_unlock(&g_klock); return R_BADENUM; }
   wake_addr_nl(addr,count);
   pm_unlock(&g_klock); return 0; }
@@ -348,15 +367,37 @@ static u32 svc_wait_sync(KThread* t, u64 hptr, u32 n, i64 timeout, u32* out_idx)
   KObj* objs[64]; u32 hs[64];
   for(u32 i=0;i<n;i++) hs[i]=gr32(hptr+i*4);
   pm_lock(&g_klock);
-  for(u32 i=0;i<n;i++){ objs[i]=h_get_nl(hs[i]); if(!objs[i] || !objs[i]->is_signaled){ pm_unlock(&g_klock); if(!objs[i]){ static u32 nw; if(nw++<20 || !(nw&0xFFFF)) WARN("WaitSynchronization: invalid handle %x (%u times)\n",hs[i],nw); } return R_BADHANDLE; } }
+  for(u32 i=0;i<n;i++){ objs[i]=h_get_nl(hs[i]); if(!objs[i] || !objs[i]->is_signaled){ pm_unlock(&g_klock); if(!objs[i]){
+        /* a stubbed service (e.g. aud:u) hands back handle 0; the caller's audio
+           thread then spins svcWaitSynchronization on it.  Sleeping ~1 ms and
+           returning timeout turns the ~16M/sec busy-loop into a throttled one
+           instead of pegging a core and flooding the log. */
+        if(hs[i]==0){ plat_sleep_ns(1000000); return R_TIMEOUT; }
+        static u32 nw; if(nw++<20 || !(nw&0xFFFF)) WARN("WaitSynchronization: invalid handle %x (%u times)\n",hs[i],nw); } return R_BADHANDLE; } }
   if(t->cancel){ t->cancel=0; pm_unlock(&g_klock); return R_CANCELLED; }
   u64 end= timeout<0? 0 : plat_ns()+(u64)timeout;
   for(;;){
-    for(u32 i=0;i<n;i++) if(objs[i]->is_signaled(objs[i])){ *out_idx=i; pm_unlock(&g_klock); return 0; }
+    for(u32 i=0;i<n;i++) if(objs[i]->is_signaled(objs[i])){
+      /* Horizon clears an auto-clear KEvent when a wait succeeds.  nxnative's
+         hle_oe.c warns that leaving a notification event signalled makes the
+         applet thread spin on a core forever; our old wait path never honoured
+         the autoclear flag at all. */
+      if(objs[i]->type==KO_EVENT && ((KEvent*)objs[i])->autoclear) ((KEvent*)objs[i])->signaled=0;
+      *out_idx=i; pm_unlock(&g_klock); return 0; }
     if(timeout==0){ pm_unlock(&g_klock); return R_TIMEOUT; }
     i64 rem=-1; if(timeout>0){ u64 now=plat_ns(); if(now>=end){ pm_unlock(&g_klock); return R_TIMEOUT; } rem=(i64)(end-now); }
     /* n==0 is a plain sleep that CancelSynchronization ends (nn::os MultiWait with only user objects) */
     t->woken=0; t->wait_kind=1; t->wait_name= n? objs[0]->name : "sleep"; t->wait_timeout=timeout;
+    /* One census-style line instead of guessing which event never fires:
+       print every object being waited on and whether it is signalled.  Rate
+       limited because a healthy game polls (service,cmd) pairs every frame. */
+    { static u32 nw; u32 k=__atomic_fetch_add(&nw,1,__ATOMIC_RELAXED);
+      if(k<48 || !(k&0x3FF)){
+        LOG("wait: thread %llu on %u objs%s:",(unsigned long long)t->id,n,
+            timeout<0? " (infinite)" : "");
+        for(u32 i=0;i<n && i<8;i++) LOG(" [%x %s sig=%d]",hs[i],
+            objs[i]->name? objs[i]->name : "?",objs[i]->is_signaled(objs[i]));
+        LOG("\n"); } }
     for(u32 i=0;i<n;i++) waiter_add(objs[i],t);
     sleep_nl(t,rem);
     for(u32 i=0;i<n;i++) waiter_del(objs[i],t);
@@ -498,8 +539,22 @@ static u32 svc_get_info_(u32 id0, u32 h, u64 id1, u64* out){
     case 24: { int live=0; for(int i=0;i<g_nthreads;i++) if(g_threads[i] && g_threads[i]->state!=2) live++; *out=(u64)(live<96? 96-live : 0); return 0; }  /* FreeThreadCount: unity skips its job threads if this
                                                                                                                                                               is 0 */
     case 0xF0000002: { KThread* t=kthread_cur(); (void)t; *out=plat_ns()*192/10000; return 0; }
-    case 26: *out=1; return 0;
-    case 27: case 28: *out=0; return 0;
+    case 26: *out=1; return 0;                                  /* [14.0.0+] IsSvcPermitted */
+    case 27: case 28: *out=0; return 0;                          /* IoRegionHint / AliasRegionExtraSize */
+    /* Switch 2 / 23.0.0+ InfoTypes (switchbrew SVC#InfoType).  nnSdk 22 queries
+       ProcessPageSize (33) during nn::init::Start and uses (value-1) as an
+       alignment mask on two addresses; returning 0 makes the mask ~0, so every
+       address fails the check and nn::diag::Abort fires before the game boots.
+       4 KiB is the guest page size our mem layer actually works with. */
+    case 29: *out=0; return 0;                                  /* [S2] RemoteRegionAddress (none) */
+    case 30: *out=0; return 0;                                  /* [S2] RemoteRegionSize */
+    case 31: *out=0; return 0;                                  /* [S2] RemoteMemoryUsage */
+    case 32: *out=0; return 0;                                  /* [S2] RemoteMemoryUsagePeak */
+    case 33: *out=0x1000ull; return 0;                          /* [S2] ProcessPageSize */
+    case 34: *out=0; return 0;                                  /* [19.0.0+] TransferMemoryHint */
+    case 36: *out=(g_as36? 0x1000000000ull : AS_SIZE)-AS_BASE; return 0; /* [23.0.0+] AddressSpaceSize */
+    case 37: *out=0; return 0;                                  /* [23.0.0+] ShadowStackRegionAddress */
+    case 38: *out=0; return 0;                                  /* [23.0.0+] ShadowStackRegionSize */
     default: WARN("GetInfo %u/%llu not implemented\n",id0,(unsigned long long)id1); *out=0; return 0;
   }
   (void)h;
@@ -536,6 +591,866 @@ static const char* gsym(u64 a){
   if(best<0 || a-g_gsyms[best].addr>0x20000) return o;
   snprintf(o,200," <%.150s+%llx>",(const char*)GP(g_gstr[g_gsyms[best].mod]+g_gsyms[best].name_off),(unsigned long long)(a-g_gsyms[best].addr));
   return o; }
+
+/* ============================================================ [S2] symbol-level HLE hooks
+   Switch 2 SDK 22 boots the GPU through
+     nv::InitializeGraphics -> nn::gs::sdk::BootGraphicsSystem
+       -> nn::gsv/nn::nvsrv::BootWithRemoteMemory -> GSV TIPC UserSession.
+   On a host there is no GSV / NVDrv2 / NVN2 stack, so walking that chain only
+   produces a sequence of nn::diag::Abort calls (here Result 0x30af3).  The
+   nxnative ports of the very same two dumps (Bananza, OOT SDK 22.2.8) replace
+   these SDK functions wholesale with HLE_FORCE instead of emulating GSV.
+
+   SwitchRecomp reaches exported SDK functions through CALLDYN -> swr_lookup
+   -> g_disp, so a host function can be installed by overwriting that dispatch
+   slot (the same mechanism hle_install() uses for its heap-lock stubs).
+   Matching by mangled symbol name, not hard-coded guest addresses, keeps this
+   working for other Switch 2 dumps.  A small address fallback covers symbols
+   that are not exported in .dynsym. */
+/* A GuestFn MUST emulate RET: thread_body() is an endless loop of
+   swr_lookup(c,c->pc)(c,c->pc), so a hook that only sets x0 leaves c->pc at
+   the hook's entry and the main thread re-enters it forever.  hle_ctrl_support
+   and hle_heap_locked both do c->pc=c->x[30] ("return like RET").  The first
+   version of these S2 hooks forgot it: hardware showed pc pinned at
+   nv::InitializeGraphics (a9bfdb0) with frames=0/GPU submits=0 for 50+ s and
+   no abort at all -- a hang, not a crash. */
+enum {
+  S2_OK=0, S2_INIT_GFX, S2_MEM_INFO, S2_CAMERA,
+  S2_VI_DISPLAY, S2_VI_LAYER, S2_VI_NATIVE,
+  S2_VI_FRAME_NO, S2_VI_PANEL_ID, S2_VI_LIST_DISP,
+  S2_VI_HDR_STATUS, S2_VI_PAPER_WHITE, S2_VI_VRR
+};
+
+static u64 g_s2_pool_addr, g_s2_pool_size, g_s2_vi_frames;
+static int g_s2_pool_inited;
+
+/* nn::vi has no host service.  nxnative hands out host static objects for the
+   display / layer / native window; here a guest address is just an offset in
+   the flat 128 GB reservation, so use three distinct values in the committed
+   low alias area.  Every SDK function consuming them is hooked, so they are
+   never dereferenced. */
+#define S2_VI_OBJ_DISPLAY 0x100001000ull
+#define S2_VI_OBJ_LAYER   0x100001100ull
+#define S2_VI_OBJ_NATIVE  0x100001200ull
+
+/* nn::sf::hipc requests on the camera context: nxnative answers every command
+   with zeroed output ("no camera"), which is what the SDK expects. */
+static int s2_camera_disp(SvcObj* o, IpcCtx* c){ (void)o; (void)c; return 0; }
+
+static int s2_guest_ptr(u64 a, u64 n){
+  return a>=AS_BASE && a<AS_SIZE && n<=AS_SIZE-a; }
+
+/* GP(a) indexes a PROT_NONE reservation: writing an uncommitted page would
+   fault.  Only touch a guest output buffer inside a committed block. */
+static int s2_guest_ok(u64 a, u64 n){
+  if(!n || !s2_guest_ptr(a,n)) return 0;
+  /* Walk EVERY block the write spans.  A single mem_query(a) only proved the
+     first block was committed, so a buffer straddling two blocks could have
+     its second half land in a PROT_NONE hole; and a read-only code/data block
+     would fault the host on memcpy.  GP() indexes the 128 GiB reservation, so
+     both checks must happen before any HLE stub writes an output object. */
+  static u32 refused;
+  for(u64 p=a; p<a+n; ){
+    MemBlock b; mem_query(p,&b);
+    const char* why = (b.state==MS_FREE || b.state==MS_INACCESSIBLE)? "uncommitted"
+                    : (!(b.perm & PERM_W))? "read-only" : 0;
+    u64 e=b.addr+b.size; if(e<=p) why="zero-length block";
+    if(why){
+      u32 k=__atomic_fetch_add(&refused,1,__ATOMIC_RELAXED);
+      if(k<8) LOG("hle: [S2] guest write refused a=%llx n=%llu p=%llx (%s)\n",
+                  (unsigned long long)a,(unsigned long long)n,(unsigned long long)p,why);
+      return 0; }
+    p = e<a+n ? e : a+n;
+  }
+  return 1; }
+
+static void s2_put(u64 a, const void* p, u64 n){
+  if(s2_guest_ok(a,n)) memcpy(GP(a),p,n); }
+static void s2_zero(u64 a, u64 n){
+  if(s2_guest_ok(a,n)) memset(GP(a),0,n); }
+
+static void hle_s2_stub(CPU* c, u64 pc, int kind){
+  static int ncalls;
+  if(ncalls++<128)
+    LOG("hle: [S2] call %llx%s kind=%d x0=%llx x1=%llx x2=%llx x3=%llx -> ret %llx\n",
+        (unsigned long long)pc,gsym(pc),kind,
+        (unsigned long long)c->x[0],(unsigned long long)c->x[1],
+        (unsigned long long)c->x[2],(unsigned long long)c->x[3],
+        (unsigned long long)c->x[30]);
+  u64 out=c->x[0];
+  switch(kind){
+    case S2_INIT_GFX:                    /* nv::InitializeGraphics(pool, size) */
+      g_s2_pool_addr=out; g_s2_pool_size=c->x[1]; g_s2_pool_inited=1;
+      LOG("hle: [S2] graphics pool %llu MiB at %llx\n",
+          (unsigned long long)(g_s2_pool_size>>20),(unsigned long long)g_s2_pool_addr);
+      break;
+    case S2_MEM_INFO:                    /* nv::GetGraphicsMemoryInfo(out) */
+      /* SDK >= 11 expects 0x40 bytes of 64-bit counters; the real
+         implementation reads an NV driver object we never create. */
+      s2_zero(out,0x40);
+      if(g_s2_pool_inited && s2_guest_ok(out,0x40)){
+        u64 sz=g_s2_pool_size;
+        memcpy(GP(out),&sz,8); memcpy(GP(out+16),&sz,8);
+      }
+      break;
+    case S2_CAMERA:                      /* camera::sdk::CreateCameraContext(out) */
+      if(s2_guest_ok(out,4)){
+        u32 h=session_new(svcobj_new("camera",s2_camera_disp,0));
+        memcpy(GP(out),&h,4);
+        LOG("hle: [S2] camera context -> handle %x\n",h);
+      }
+      break;
+    case S2_VI_DISPLAY: case S2_VI_LAYER: case S2_VI_NATIVE: {
+      u64 obj = kind==S2_VI_DISPLAY ? S2_VI_OBJ_DISPLAY :
+                kind==S2_VI_LAYER   ? S2_VI_OBJ_LAYER   : S2_VI_OBJ_NATIVE;
+      s2_put(out,&obj,8); break; }
+    case S2_VI_FRAME_NO: {
+      u64 f=++g_s2_vi_frames; s2_put(out,&f,8); break; }
+    case S2_VI_PANEL_ID: s2_zero(out,0x18); break;
+    case S2_VI_LIST_DISP:                 /* returns a count, not a Result */
+      s2_zero(out,0x60);
+      if(s2_guest_ok(out,0x60)){
+        memcpy(GP(out),"Default",8);
+        u8 one=1; memcpy(GP(out+0x40),&one,1);
+        u64 lim[3]={1,1920,1080}; memcpy(GP(out+0x48),lim,24);
+      }
+      c->x[0]=1; c->pc=c->x[30]; return;
+    case S2_VI_HDR_STATUS:              /* SDR: off, fmt 0, peak 0 */
+      s2_zero(c->x[0],1); s2_zero(c->x[1],4); s2_zero(c->x[2],2); break;
+    case S2_VI_PAPER_WHITE: { u16 nits=203; s2_put(out,&nits,2); break; }
+    case S2_VI_VRR: s2_zero(out,1); break;
+  }
+  c->x[0]=0;                            /* Result OK */
+  c->pc=c->x[30];                       /* RET */
+}
+
+/* ---- nn::vi vsync: a real SystemEvent instead of an empty Result-OK stub --
+   The generated SDK code for nn::os::CreateSystemEvent (sdk F_A5B8580) shows
+   the layout of nn::os::SystemEventType on this dump: the two kernel handles
+   live at +0x14/+0x18, +0x10 is the clear mode, +0x13 is an init marker and
+   +0x28 is the state (2 = system event made by svcCreateEvent).  Returning an
+   all-zero structure made every Wait/TryWait fail, which is exactly what the
+   10 ms SleepThread poll loop in run 1636 was doing.  A 60 Hz host ticker
+   signals the event so an infinite wait is paced, not deadlocked. */
+static KEvent* g_vi_vsync_ev;
+static void s2_vsync_tick(void* p){
+  (void)p;
+  for(;;){ plat_sleep_ns(16666667); if(g_vi_vsync_ev) kevent_signal(g_vi_vsync_ev); }
+}
+static void hle_s2_vi_vsync_impl(CPU* c, u64 pc, u64 out){
+  (void)pc;
+  if(!g_vi_vsync_ev){
+    g_vi_vsync_ev=kevent_new("vi vsync",1);   /* auto-clear, one tick per wait */
+    kobj_ref(&g_vi_vsync_ev->o);
+    plat_thread(s2_vsync_tick,NULL,64*1024);
+    LOG("hle: [S2] vi vsync event created, 60 Hz host tick started\n");
+  }
+  u32 r=h_new(&g_vi_vsync_ev->o), w=h_new(&g_vi_vsync_ev->o);
+  if(s2_guest_ok(out,0x30)){
+    u8 z[0x30]; memset(z,0,sizeof z);
+    z[0x10]=1;                                   /* auto clear */
+    z[0x13]=1;                                   /* initialized */
+    memcpy(z+0x14,&r,4); memcpy(z+0x18,&w,4);    /* read / write handles */
+    z[0x28]=2;                                   /* system event */
+    memcpy(GP(out),z,sizeof z);
+  } else { static int nw; if(nw++<4)
+      LOG("hle: [S2] vi vsync write refused a=%llx\n",(unsigned long long)out); }
+  { static int nv; if(nv++<8)
+      LOG("hle: [S2] vi vsync -> handles %x/%x at %llx\n",r,w,(unsigned long long)out); }
+  c->x[0]=0; c->pc=c->x[30]; }
+static void hle_s2_vi_vsync(CPU* c, u64 pc){ hle_s2_vi_vsync_impl(c,pc,c->x[0]); }
+/* DefaultDisplay::Duplicate*Event(SystemEventType* out) is a member function:
+   x0 is `this` (DefaultDisplay*), x1 is `out`. */
+static void hle_s2_vi_vsync_mem(CPU* c, u64 pc){ hle_s2_vi_vsync_impl(c,pc,c->x[1]); }
+static void hle_s2_vi_vsync_try(CPU* c, u64 pc){
+  (void)pc;
+  u64 f=__atomic_add_fetch(&g_s2_vi_frames,1,__ATOMIC_RELAXED);
+  { static int nv; if(nv++<8) LOG("hle: [S2] vi vsync TryWait -> true (frame %llu)\n",
+                                  (unsigned long long)f); }
+  c->x[0]=1; c->pc=c->x[30]; }
+
+static void hle_s2_ok(CPU* c, u64 pc){ hle_s2_stub(c,pc,S2_OK); }
+static void hle_s2_true(CPU* c, u64 pc){ (void)pc; c->x[0]=1; c->pc=c->x[30]; }
+static void hle_s2_vi_native_ret(CPU* c, u64 pc){ (void)pc; c->x[0]=S2_VI_OBJ_NATIVE; c->pc=c->x[30]; }
+static void hle_s2_init(CPU* c, u64 pc){ hle_s2_stub(c,pc,S2_INIT_GFX); }
+static void hle_s2_meminfo(CPU* c, u64 pc){ hle_s2_stub(c,pc,S2_MEM_INFO); }
+static void hle_s2_camera(CPU* c, u64 pc){ hle_s2_stub(c,pc,S2_CAMERA); }
+static void hle_s2_vi_display(CPU* c, u64 pc){ hle_s2_stub(c,pc,S2_VI_DISPLAY); }
+static void hle_s2_vi_layer(CPU* c, u64 pc){ hle_s2_stub(c,pc,S2_VI_LAYER); }
+static void hle_s2_vi_native(CPU* c, u64 pc){ hle_s2_stub(c,pc,S2_VI_NATIVE); }
+static void hle_s2_vi_frameno(CPU* c, u64 pc){ hle_s2_stub(c,pc,S2_VI_FRAME_NO); }
+static void hle_s2_vi_panel(CPU* c, u64 pc){ hle_s2_stub(c,pc,S2_VI_PANEL_ID); }
+static void hle_s2_vi_listdisp(CPU* c, u64 pc){ hle_s2_stub(c,pc,S2_VI_LIST_DISP); }
+static void hle_s2_vi_hdrstatus(CPU* c, u64 pc){ hle_s2_stub(c,pc,S2_VI_HDR_STATUS); }
+static void hle_s2_vi_paperwhite(CPU* c, u64 pc){ hle_s2_stub(c,pc,S2_VI_PAPER_WHITE); }
+static void hle_s2_vi_vrr(CPU* c, u64 pc){ hle_s2_stub(c,pc,S2_VI_VRR); }
+
+/* ---- NVN null-device takeover -------------------------------------------
+   nxnative (dm/gfx/nvn/hle_nvn.c) force-replaces nvnBootstrapLoader, which
+   main imports from sdk: all 523 NVN names resolve to host thunks and the
+   SDK's NVN driver never runs.  We have no host NVN backend yet, so hand out
+   a small set of "null device" slots instead.  Without this the game walks
+   into the real NVN driver: NvRmMemHandleAllocAttr -> NvOsDrvGpuGetGpukDevice
+   -> nn::diag::Abort(0x30af3) -> svcBreak (verified 2026-11-09, run 1619).
+
+   The slot addresses are DISCOVERED from the dump's own symbol table, so the
+   same code works on OOT: otherwise-unused NvOsDrv/NvRm/nvn exports become
+   trampolines whose dispatch entries we own.  Every requested NVN name is
+   logged (both via nvnBootstrapLoader and nvnDeviceGetProcAddress), so one
+   run exposes the whole NVN surface the game actually uses. */
+#define S2_NVN_OBJ_TRUE   0x100001400ull
+#define S2_NVN_OBJ_HANDLE 0x100001500ull
+static u64 g_nvn_slot_true, g_nvn_slot_zero, g_nvn_slot_proc, g_nvn_slot_obj;
+static u64 g_nvn_slot_int, g_nvn_slot_size, g_nvn_slot_acq;
+static u64 g_nvn_scratch;
+static u32 g_nvn_lookups, g_nvn_calls;
+
+static u64 s2_nvn_scratch_addr(void){
+  if(!g_nvn_scratch){
+    g_nvn_scratch=kmem_alloc(16ull<<20,MS_NORMAL,PERM_RW);
+    LOG("hle: [S2] allocated 16 MiB NVN scratch buffer at %llx\n",(unsigned long long)g_nvn_scratch);
+  }
+  return g_nvn_scratch? g_nvn_scratch : S2_NVN_OBJ_TRUE;
+}
+
+/* guest is a flat reservation: only read a string inside a committed block */
+static int s2_cstr(u64 a, char* out, int cap){
+  if(cap<=0) return 0;
+  out[0]=0;
+  if(a<AS_BASE || a>=AS_SIZE) return 0;
+  MemBlock b; mem_query(a,&b);
+  if(b.state==MS_FREE || b.state==MS_INACCESSIBLE || !(b.perm&PERM_R)) return 0;
+  u64 room=b.addr+b.size-a; if(room>=(u64)cap) room=(u64)cap-1;
+  const char* p=(const char*)GP(a); int i=0;
+  for(; i<(int)room; i++){
+    unsigned char ch=(unsigned char)p[i];
+    if(!ch){ out[i]=0; return i>0; }
+    if(ch<0x20 || ch>=0x7F){ out[0]=0; return 0; }
+    out[i]=(char)ch;
+  }
+  out[0]=0; return 0; }
+
+/* Track unique NVN caller return addresses so new call sites are always logged
+   even after high-frequency loops exhaust the initial call counter.
+   Once the 512-entry table is full, treat further unseen LRs as seen (return 1)
+   so high-frequency loops never spam LOG()/fsync() on every iteration. */
+static int s2_nvn_lr_seen(u64 lr){
+  static u64 seen[512]; static u32 nseen;
+  u32 n=__atomic_load_n(&nseen,__ATOMIC_RELAXED);
+  u32 lim=n<512? n : 512;
+  for(u32 i=0;i<lim;i++) if(seen[i]==lr) return 1;
+  if(n>=512) return 1;
+  u32 idx=__atomic_fetch_add(&nseen,1,__ATOMIC_RELAXED);
+  if(idx<512){ seen[idx]=lr; return 0; }
+  return 1; }
+
+/* Track NVN MemoryPoolBuilder / BufferBuilder storage bindings so that
+   nvnMemoryPoolMap / nvnMemoryPoolGetBufferAddress and nvnBufferMap /
+   nvnBufferGetAddress return the actual guest CPU buffer passed to
+   nvnMemoryPoolBuilderSetStorage(builder, memory, size) (e.g. the 1.36 MiB
+   shader archive at 0x10ae06000 in run 1923) or pool_base + offset from
+   nvnBufferBuilderSetStorage(builder, pool, offset, size), instead of
+   returning the zero-filled dummy scratch buffer 0x140000b000. */
+typedef struct { u64 key, addr, size; } S2NvnMapEnt;
+static S2NvnMapEnt g_nvn_builders[64];
+static u32 g_nvn_builder_wr;
+static S2NvnMapEnt g_nvn_objs[512];
+static u32 g_nvn_obj_wr;
+
+static int s2_nvn_lookup_obj(u64 obj, u64* out_addr, u64* out_size){
+  if(!obj) return 0;
+  u32 n=__atomic_load_n(&g_nvn_obj_wr,__ATOMIC_RELAXED);
+  u32 lim=n<512? n : 512;
+  /* Search newest entries first in case an object address was reused. */
+  for(u32 k=0;k<lim;k++){
+    u32 idx=(n-1-k)&511u;
+    if(g_nvn_objs[idx].key==obj && g_nvn_objs[idx].addr){
+      if(out_addr) *out_addr=g_nvn_objs[idx].addr;
+      if(out_size) *out_size=g_nvn_objs[idx].size;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static void s2_nvn_record_builder(u64 bld, u64 addr, u64 size){
+  for(u32 i=0;i<64;i++){
+    if(g_nvn_builders[i].key==bld){
+      g_nvn_builders[i].addr=addr; g_nvn_builders[i].size=size; return;
+    }
+  }
+  u32 idx=__atomic_fetch_add(&g_nvn_builder_wr,1,__ATOMIC_RELAXED)&63u;
+  g_nvn_builders[idx].key=bld; g_nvn_builders[idx].addr=addr; g_nvn_builders[idx].size=size;
+}
+
+static int s2_nvn_lookup_builder(u64 bld, u64* out_addr, u64* out_size){
+  if(!bld) return 0;
+  for(u32 i=0;i<64;i++){
+    if(g_nvn_builders[i].key==bld && g_nvn_builders[i].addr){
+      if(out_addr) *out_addr=g_nvn_builders[i].addr;
+      if(out_size) *out_size=g_nvn_builders[i].size;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static void s2_nvn_record_obj(u64 obj, u64 addr, u64 size){
+  u32 n=__atomic_load_n(&g_nvn_obj_wr,__ATOMIC_RELAXED);
+  u32 lim=n<512? n : 512;
+  for(u32 i=0;i<lim;i++){
+    if(g_nvn_objs[i].key==obj){
+      g_nvn_objs[i].addr=addr; g_nvn_objs[i].size=size; return;
+    }
+  }
+  u32 idx=__atomic_fetch_add(&g_nvn_obj_wr,1,__ATOMIC_RELAXED)&511u;
+  g_nvn_objs[idx].key=obj; g_nvn_objs[idx].addr=addr; g_nvn_objs[idx].size=size;
+}
+
+static void s2_nvn_track_set_storage(CPU* c){
+  u64 x0=c->x[0], x1=c->x[1], x2=c->x[2], x3=c->x[3];
+  if(!s2_guest_ok(x0,32)) return;
+  /* Case 1: nvnBufferBuilderSetStorage(builder=x0, pool=x1, offset=x2, size=x3) */
+  u64 pool_addr=0, pool_sz=0;
+  if(s2_nvn_lookup_obj(x1,&pool_addr,&pool_sz)){
+    if(!pool_sz || x2<pool_sz){
+      u64 bsz = (x3 && x3<=pool_sz)? x3 : (pool_sz>x2 ? pool_sz-x2 : 0x1000ull);
+      s2_nvn_record_builder(x0, pool_addr+x2, bsz);
+      return;
+    }
+  }
+  /* Case 2: nvnMemoryPoolBuilderSetStorage(builder=x0, memory=x1, size=x2)
+     where x1 is a non-stack guest allocation and x2 is its byte size.
+     Check 64 bytes at x1 rather than the entire x2 span since large pools
+     (e.g. 676 MiB at lr=0x849c808) can span multiple MemBlock regions. */
+  if(x1>=AS_BASE && x1<AS_SIZE && !(x1>=0x1300000000ull && x1<0x1300200000ull) &&
+     x2>=0x20ull && x2<=0x40000000ull && s2_guest_ok(x1,64)){
+    s2_nvn_record_builder(x0, x1, x2);
+    return;
+  }
+  /* Case 3: nvnMemoryPoolBuilderSetStorage(builder=x0, memory=NULL, size=x2) */
+  if(x1==0 && x2>=0x1000ull && x2<=0x40000000ull){
+    s2_nvn_record_builder(x0, s2_nvn_scratch_addr(), x2);
+  }
+}
+
+static void s2_nvn_track_init(CPU* c){
+  u64 x0=c->x[0], x1=c->x[1];
+  if(!s2_guest_ok(x0,32) || !s2_guest_ok(x1,32)) return;
+  u64 b_addr=0, b_sz=0;
+  if(s2_nvn_lookup_builder(x1,&b_addr,&b_sz)){
+    s2_nvn_record_obj(x0, b_addr, b_sz);
+  }
+}
+
+/* In Bananza's NVN texture/sampler descriptor pool manager (F_813a27c,
+   returned to at lr=0x813a538 after nvnTextureInitialize), x19 holds the
+   descriptor pool manager object:
+     *(u32*)(x19 + 0xaa0) [2720] = pool capacity (power of 2, e.g. 4096)
+     *(u64*)(x19 + 0xaa8) [2728] = pointer to array of 40-byte descriptor slots
+     *(u16*)(x19 + 0xb12) [2834] = reserved descriptor count (256)
+     *(u32*)(x19 + 0xb14) [2836] = atomic next-slot counter
+   Each 40-byte slot at slot_array + idx*40 has a 32-bit state at offset +0:
+     -1 (0xFFFFFFFF) = free slot (acquired via CAS(-1 -> 1) at 0x813a578 / 0x813a5fc)
+   Allocate the 40-byte slot table in its own dedicated kmem_alloc block so
+   guest buffer writes to g_nvn_scratch never overwrite slot states. */
+static void s2_nvn_heal_pool(CPU* c){
+  u64 lr=c->x[30];
+  if(lr<0x8138000ull || lr>0x813c000ull) return;
+  u64 mgr=c->x[19];
+  if(!s2_guest_ok(mgr,0xb20)) return;
+  u32 cap=0; u64 arr=0; u16 rsv=0;
+  memcpy(&cap,GP(mgr+0xaa0),4);
+  memcpy(&arr,GP(mgr+0xaa8),8);
+  memcpy(&rsv,GP(mgr+0xb12),2);
+  int need_init=0;
+  if(cap<512 || (cap&(cap-1))!=0){ cap=4096; memcpy(GP(mgr+0xaa0),&cap,4); need_init=1; }
+  if(!s2_guest_ok(arr,(u64)cap*40ull)){
+    static u64 pool_slots_va;
+    if(!pool_slots_va){
+      pool_slots_va = kmem_alloc(256ull<<10,MS_NORMAL,PERM_RW);
+      if(s2_guest_ok(pool_slots_va,(u64)cap*40ull)){
+        u8* p=(u8*)GP(pool_slots_va);
+        memset(p,0,(size_t)cap*40u);
+        u32 free_tag=0xFFFFFFFFu;
+        for(u32 i=0;i<cap;i++) memcpy(p+(size_t)i*40u,&free_tag,4);
+      }
+    }
+    arr=pool_slots_va;
+    memcpy(GP(mgr+0xaa8),&arr,8);
+    need_init=1;
+  }
+  if(s2_guest_ok(arr,(u64)cap*40ull)){
+    u8* p=(u8*)GP(arr);
+    u32 free_cnt=0, free_tag=0xFFFFFFFFu;
+    for(u32 i=0;i<cap;i++){
+      u32 st=0; memcpy(&st,p+(size_t)i*40u,4);
+      if(st==0xFFFFFFFFu) free_cnt++;
+    }
+    if(free_cnt<64){
+      for(u32 i=0;i<cap;i++){
+        u32 st=0; memcpy(&st,p+(size_t)i*40u,4);
+        if(st==0 || need_init) memcpy(p+(size_t)i*40u,&free_tag,4);
+      }
+      LOG("hle: [S2] healed NVN descriptor pool at mgr=%llx: cap=%u arr=%llx rsv=%u (was free=%u) lr=%llx\n",
+          (unsigned long long)mgr,cap,(unsigned long long)arr,rsv,free_cnt,(unsigned long long)lr);
+    }
+  }
+}
+
+static void hle_s2_nvn_true(CPU* c,u64 pc){
+  (void)pc;
+  s2_nvn_heal_pool(c);
+  s2_nvn_track_init(c);
+  u32 k=__atomic_fetch_add(&g_nvn_calls,1,__ATOMIC_RELAXED);
+  if(k<64 || !s2_nvn_lr_seen(c->x[30]))
+    LOG("hle: [S2] nvn call TRUE  x0=%llx x1=%llx x2=%llx lr=%llx\n",
+        (unsigned long long)c->x[0],(unsigned long long)c->x[1],
+        (unsigned long long)c->x[2],(unsigned long long)c->x[30]);
+  c->x[0]=1; c->pc=c->x[30]; }
+static void hle_s2_nvn_zero(CPU* c,u64 pc){
+  (void)pc;
+  s2_nvn_track_set_storage(c);
+  u32 k=__atomic_fetch_add(&g_nvn_calls,1,__ATOMIC_RELAXED);
+  if(k<64 || !s2_nvn_lr_seen(c->x[30]))
+    LOG("hle: [S2] nvn call ZERO  x0=%llx x1=%llx x2=%llx lr=%llx\n",
+        (unsigned long long)c->x[0],(unsigned long long)c->x[1],
+        (unsigned long long)c->x[2],(unsigned long long)c->x[30]);
+  c->x[0]=0; c->pc=c->x[30]; }
+static void hle_s2_nvn_obj(CPU* c,u64 pc){
+  (void)pc;
+  u64 a=0, sz=0;
+  if(!s2_nvn_lookup_obj(c->x[0],&a,&sz)) a=s2_nvn_scratch_addr();
+  /* Defense-in-depth for the 6x-unrolled shader stage loop at 0x847da60..0x847db98:
+     the stack buffer at sp+8 is 1152 bytes (at most 8 iterations of 144 bytes).
+     If [sp+4] / x26 underflowed to <= 0 (or exceeded 8), clamp x26 and [sp+4] to 1
+     so 0x847db7c (subs x26, x26, #1; b.ne) exits cleanly without smashing the stack. */
+  if(c->x[30]>=0x847da80ull && c->x[30]<=0x847db80ull){
+    if((i64)c->x[26]<=0 || c->x[26]>8){
+      c->x[26]=1;
+      if(s2_guest_ok(c->x[31]+4,4)){
+        i32 cnt=0; memcpy(&cnt,GP(c->x[31]+4),4);
+        if(cnt<=0 || cnt>8){ cnt=1; memcpy(GP(c->x[31]+4),&cnt,4); }
+      }
+    }
+  }
+  u32 k=__atomic_fetch_add(&g_nvn_calls,1,__ATOMIC_RELAXED);
+  if(k<64 || !s2_nvn_lr_seen(c->x[30]))
+    LOG("hle: [S2] nvn call OBJ   x0=%llx x1=%llx -> %llx lr=%llx\n",
+        (unsigned long long)c->x[0],(unsigned long long)c->x[1],
+        (unsigned long long)a,(unsigned long long)c->x[30]);
+  c->x[0]=a; c->pc=c->x[30]; }
+/* NVN queries returning a size_t / alignment / stride / free space in x0
+   (e.g. nvnTextureBuilderGetStorageSize, nvnTextureBuilderGetStorageAlignment,
+   nvnQueueBuilderGet*MemorySize, nvnMemoryPoolGetSize).  Returning the scratch
+   pointer (0x140000b000 = 85.9 GiB) makes the game try to allocate 85.9 GiB
+   from its 3.2 GiB heap, get NULL, and fault filling 0x0..0x200000 (run 1735).
+   4096 (0x1000) is a valid power-of-two page alignment and a small, 4-byte
+   aligned byte size so both heap allocations and CPU fill loops complete in
+   microseconds. */
+static void hle_s2_nvn_size(CPU* c,u64 pc){
+  (void)pc;
+  u64 sz=4096;
+  static u32 nsz; u32 k=__atomic_fetch_add(&nsz,1,__ATOMIC_RELAXED);
+  if(k<64 || !s2_nvn_lr_seen(c->x[30]))
+    LOG("hle: [S2] nvn call SIZE  x0=%llx x1=%llx -> %llu lr=%llx\n",
+        (unsigned long long)c->x[0],(unsigned long long)c->x[1],
+        (unsigned long long)sz,(unsigned long long)c->x[30]);
+  c->x[0]=sz; c->pc=c->x[30]; }
+/* nvnDeviceGetInteger(const NVNdevice *device, NVNdeviceInfo pname, int *v):
+   Note that in NVN, device can be NULL for static queries, so check x0/x1 if
+   x2 is not a pointer.  Leaving *v uninitialized (0 or stack garbage) causes
+   pool/descriptor size calculations and ring loops to spin or divide by 0. */
+static void hle_s2_nvn_int(CPU* c,u64 pc){
+  (void)pc;
+  u32 pname=(u32)c->x[1]; u64 out=c->x[2];
+  if(!s2_guest_ok(out,4) && s2_guest_ok(c->x[1],4)){ pname=(u32)c->x[0]; out=c->x[1]; }
+  i32 val=256;
+  /* NVN_DEVICE_INFO_API_MAJOR_VERSION=0 (55), MINOR=1 (13),
+     MAX_TEXTURE_POOL_SIZE=59 (1048576), MAX_SAMPLER_POOL_SIZE=60 (4096),
+     alignments (4096), and 256 for descriptor sizes / reserved count queries (57, 58, etc.). */
+  if(pname==0) val=55;
+  else if(pname==1) val=13;
+  else if(pname==59) val=1048576;
+  else if(pname==60) val=4096;
+  else if(pname==81 || pname==85 || pname==91) val=4096;
+  if(s2_guest_ok(out,4)) memcpy(GP(out),&val,4);
+  static u32 nint; u32 k=__atomic_fetch_add(&nint,1,__ATOMIC_RELAXED);
+  if(k<96 || !s2_nvn_lr_seen(c->x[30]))
+    LOG("hle: [S2] nvn GetInteger pname=%u (%#x) out=%llx -> %d lr=%llx\n",
+        pname,pname,(unsigned long long)out,val,(unsigned long long)c->x[30]);
+  c->x[0]=0; c->pc=c->x[30]; }
+/* nvnWindowAcquireTexture(NVNwindow *window, NVNsync * presentSync, int *idx) -> 0 (SUCCESS) */
+static void hle_s2_nvn_acq(CPU* c,u64 pc){
+  (void)pc;
+  i32 idx=0;
+  if(s2_guest_ok(c->x[2],4)) memcpy(GP(c->x[2]),&idx,4);
+  else if(s2_guest_ok(c->x[1],4)) memcpy(GP(c->x[1]),&idx,4);
+  static u32 nacq; u32 k=__atomic_fetch_add(&nacq,1,__ATOMIC_RELAXED);
+  if(k<16) LOG("hle: [S2] nvn WindowAcquireTexture -> idx=0 SUCCESS lr=%llx\n",(unsigned long long)c->x[30]);
+  c->x[0]=0; c->pc=c->x[30]; }
+
+static u64 s2_nvn_resolve(const char* nm, int ok){
+  u64 slot=g_nvn_slot_true;
+  if(!ok) return slot;
+  if(strstr(nm,"ProcAddress") || strstr(nm,"GetProc") || strstr(nm,"BootstrapLoader"))
+    slot=g_nvn_slot_proc? g_nvn_slot_proc : slot;
+  else if(strstr(nm,"GetInteger"))
+    slot=g_nvn_slot_int? g_nvn_slot_int : slot;
+  else if(strstr(nm,"AcquireTexture"))
+    slot=g_nvn_slot_acq? g_nvn_slot_acq : (g_nvn_slot_zero? g_nvn_slot_zero : slot);
+  else if(((strstr(nm,"Get") || strstr(nm,"Calculate")) &&
+           (strstr(nm,"Size") || strstr(nm,"Alignment") || strstr(nm,"Stride") ||
+            strstr(nm,"Free") || strstr(nm,"Threshold") || strstr(nm,"Total"))) ||
+          strstr(nm,"GetCommandMemoryFree") || strstr(nm,"GetControlMemoryFree"))
+    slot=g_nvn_slot_size? g_nvn_slot_size : slot;
+  else if((strstr(nm,"Get") && (strstr(nm,"Offset") || strstr(nm,"MemoryUsed"))) ||
+          strstr(nm,"GetCurrentTimestamp"))
+    slot=g_nvn_slot_zero? g_nvn_slot_zero : slot;
+  else if(strstr(nm,"PoolMap") || strstr(nm,"BufferMap") ||
+          strstr(nm,"GetAddress") || strstr(nm,"GetBufferAddress") || strstr(nm,"GetTextureAddress") ||
+          strstr(nm,"GetHandle") || strstr(nm,"GetTextureHandle") || strstr(nm,"GetTexelFetchHandle") ||
+          strstr(nm,"GetImageHandle") || strstr(nm,"GetSeparate") || strstr(nm,"EndRecording") ||
+          strstr(nm,"GetMemoryPool") || strstr(nm,"GetDevice") ||
+          !strcmp(nm,"nvnEventBuilderGetStorage") ||
+          !strcmp(nm,"nvnWindowBuilderGetNativeWindow") || !strcmp(nm,"nvnWindowGetNativeWindow"))
+    slot=g_nvn_slot_obj? g_nvn_slot_obj : slot;
+  else if(strstr(nm,"SyncWait") || strstr(nm,"Wait") || strstr(nm,"WalkDebug") ||
+          strstr(nm,"Set") || strstr(nm,"Bind") || strstr(nm,"Draw") || strstr(nm,"Clear") ||
+          strstr(nm,"Submit") || strstr(nm,"Finish") || strstr(nm,"Flush") ||
+          strstr(nm,"Finalize") || strstr(nm,"Destroy") || strstr(nm,"Free") ||
+          strstr(nm,"Reset") || strstr(nm,"Barrier") || strstr(nm,"Fence") ||
+          strstr(nm,"Copy") || strstr(nm,"Present") || strstr(nm,"Begin") || strstr(nm,"End") ||
+          strstr(nm,"Update") || strstr(nm,"Discard") || strstr(nm,"Invalidate") ||
+          strstr(nm,"Restore") || strstr(nm,"Register") || strstr(nm,"ComputeDirtyTileMap") ||
+          strstr(nm," dispatch") || strstr(nm,"Dispatch"))
+    slot=g_nvn_slot_zero? g_nvn_slot_zero : slot;
+  return slot;
+}
+
+static void hle_s2_nvn_proc(CPU* c,u64 pc){
+  /* nvnDeviceGetProcAddress(const NVNdevice *device, const char *name):
+     x0 is `device` (often NULL or a guest struct ptr), x1 is `name`.
+     Check x1 first, then x0 in case a single-arg loader calls through here. */
+  char nm[128];
+  int ok=s2_cstr(c->x[1],nm,sizeof nm);
+  if(!ok) ok=s2_cstr(c->x[0],nm,sizeof nm);
+  u32 k=__atomic_fetch_add(&g_nvn_lookups,1,__ATOMIC_RELAXED);
+  u64 slot=s2_nvn_resolve(nm,ok);
+  if(k<600) LOG("hle: [S2] nvn lookup #%u %-58s -> %llx (via GetProcAddress)%s\n",
+                k,ok?nm:"<?>",(unsigned long long)slot,gsym(pc));
+  c->x[0]=slot; c->pc=c->x[30]; }
+
+static void hle_s2_nvn_bootstrap(CPU* c,u64 pc){
+  char nm[128]; int ok=s2_cstr(c->x[0],nm,sizeof nm);
+  if(!ok) ok=s2_cstr(c->x[1],nm,sizeof nm);
+  u32 k=__atomic_fetch_add(&g_nvn_lookups,1,__ATOMIC_RELAXED);
+  u64 slot=s2_nvn_resolve(nm,ok);
+  if(k<600) LOG("hle: [S2] nvn lookup #%u %-58s -> %llx%s\n",
+                k,ok?nm:"<?>",(unsigned long long)slot,gsym(pc));
+  c->x[0]=slot; c->pc=c->x[30]; }
+
+/* NV driver glue: the host has no nvdrv.  nxnative's dm/host/hle_nvdrv.c
+   force-replaces the whole family so callers take their own failure path
+   instead of aborting inside nn::diag::Abort.  Take over every exported
+   NvOsDrv* (and a few NvRm* allocators) in one pass, and log the full family
+   so a single run shows every NV export on this dump. */
+static u32 g_nv_calls;
+static void hle_s2_nv(CPU* c,u64 pc,int kind){
+  u32 k=__atomic_fetch_add(&g_nv_calls,1,__ATOMIC_RELAXED);
+  if(k<96) LOG("hle: [S2] nvdrv call %llx kind=%d%s\n",
+               (unsigned long long)pc,kind,gsym(pc));
+  switch(kind){
+    case 1: c->x[0]=(u64)-1; break;              /* Open: no device */
+    case 2: c->x[0]=3; break;                    /* Ioctl/QueryEvent: NV_ERR */
+    case 3: c->x[0]=S2_NVN_OBJ_TRUE; break;      /* GpuGetGpukDevice: opaque object */
+    case 4: c->x[0]=S2_NVN_OBJ_HANDLE; break;    /* NvRm allocation: opaque handle */
+    default: c->x[0]=0; break;                   /* success / no-op */
+  }
+  c->pc=c->x[30]; }
+static void hle_s2_nv_ok    (CPU* c,u64 pc){ hle_s2_nv(c,pc,0); }
+static void hle_s2_nv_open  (CPU* c,u64 pc){ hle_s2_nv(c,pc,1); }
+static void hle_s2_nv_err   (CPU* c,u64 pc){ hle_s2_nv(c,pc,2); }
+static void hle_s2_nv_device(CPU* c,u64 pc){ hle_s2_nv(c,pc,3); }
+static void hle_s2_nv_handle(CPU* c,u64 pc){ hle_s2_nv(c,pc,4); }
+
+/* Bananza Switch 2 shader-reflection lookup at 0x884f2c0: the engine reads a
+   material-stage binary-reflection object pointer from +0x68 of the stage
+   struct and passes it as x0.  When the reflection symbol is unbound the
+   pointer is null or a low sentinel (0x10000000041 observed), and the
+   recompiled function dereferences it (ldr x22,[x0,#0xd8]) -> SIGSEGV at ~5.5 s.
+   Guard: x0 null/unmapped -> return -1 (not-found index; the caller stores w0
+   into a u32 array and skips the unbound slot); otherwise run the real fn. */
+static GuestFn g_s2_orig_gfb;
+static void hle_s2_gfb(CPU* c, u64 pc){
+  u64 p=c->x[0];
+  if(p==0){ c->x[0]=(u64)-1; c->pc=c->x[30]; return; }
+  MemBlock b; mem_query(p,&b);
+  if(b.state==MS_FREE || b.state==MS_INACCESSIBLE){ c->x[0]=(u64)-1; c->pc=c->x[30]; return; }
+  if(g_s2_orig_gfb) g_s2_orig_gfb(c,pc);
+  else c->pc=c->x[30];
+}
+
+/* shader/material reflection traversal helper at 0x99a6350.  The material-stage
+   reflection loop at 0x8864708 calls it four times (bl at 8864774/88647c4/
+   88647ec/8864810).  The *first* call's return value is read by the caller at
+   [x0,#0x1c] as the stage count, and the entire loop is skipped when that is <1.
+   The function is NOT recompiled -- its body is the generic interpreter
+   trampoline -- so it runs through the interpreter and dereferences an unbound
+   NVN object sentinel (0x10000000101) at +0x18, faulting with an invalid memory
+   access (crash pc=8864814 in run 2026-11-09_2031).  Returning the zero-filled
+   NVN scratch object makes [x0,#0x1c] read 0, so the caller skips the whole
+   loop (including the crashing 4th call) instead of cascading. */
+static GuestFn g_s2_orig_refl;
+static void hle_s2_refl(CPU* c, u64 pc){
+  (void)pc;
+  c->x[0]=s2_nvn_scratch_addr();
+  c->pc=c->x[30];
+}
+
+/* Match a distinctive mangled substring rather than the full symbol: exported
+   names carry parameter suffixes that differ between dumps.  Keep the matching
+   string specific enough to exclude lookalikes -- an earlier table used bare
+   "InitializeGraphics" / "9InitCheckE" / "BootWithRemoteMemory" and silently
+   hooked nn::gs3sdk::InitializeGraphicsAllocator, nandroid::ESDS::InitCheck
+   and nn::gs3sdk::CanBootWithRemoteMemory as well.
+   Every entry here is backed by nxnative's HLE_FORCE set for the same two
+   Switch 2 dumps (Bananza / OOT SDK 22.2.8): dm/gfx/hle_nv.c and hle_vi.c. */
+static const struct { const char* sym; GuestFn fn; } g_s2_hooks[]={
+  {"2nn2gs3sdk18BootGraphicsSystemE", hle_s2_ok},
+  {"2nv18InitializeGraphicsE", hle_s2_init},
+  {"2nv16FinalizeGraphicsE", hle_s2_ok},
+  {"2nv20SetGraphicsAllocatorE", hle_s2_ok},
+  {"2nv28SetGraphicsDevtoolsAllocatorE", hle_s2_ok},
+  {"2nv9InitCheckE", hle_s2_ok},
+  {"2nn2gs3sdk30CheckGraphicsSystemInitializedE", hle_s2_ok},
+  {"2nv21GetGraphicsMemoryInfoE", hle_s2_meminfo},
+  {"2nv22DumpGraphicsMemoryInfoE", hle_s2_ok},
+  {"20BootWithRemoteMemoryE", hle_s2_ok},       /* nn::nvsrv / nn::gsv / gpu::sdk */
+  {"2nn6camera3sdk19CreateCameraContextE", hle_s2_camera},
+  /* nn::vi: nxnative's hle_vi.c takes over the entire display subsystem.  The
+     crucial one is nn::vi::Initialize -- without it the SDK's own
+     vi::sdk::Initialize asks the graphics server for a user session, gets
+     0x30af3 and calls nn::diag::Abort(Result). */
+  {"2nn2vi10InitializeE", hle_s2_ok},
+  {"2nn2vi8FinalizeE", hle_s2_ok},
+  {"2nn2vi18OpenDefaultDisplayE", hle_s2_vi_display},
+  {"2nn2vi11OpenDisplayE", hle_s2_vi_display},
+  {"2nn2vi11CreateLayerE", hle_s2_vi_layer},
+  {"2nn2vi15GetNativeWindowE", hle_s2_vi_native},
+  {"2nn2vi5Layer15GetNativeWindowEv", hle_s2_vi_native_ret},
+  {"2nn2vi7Display6IsOpenEv", hle_s2_true},
+  {"2nn2vi5Layer6IsOpenEv", hle_s2_true},
+  {"2nn2vi6detail13IsInitializedEv", hle_s2_true},
+  {"2nn2vi6detail16IsDefaultDisplayE", hle_s2_true},
+  {"2nn2vi20GetLatestFrameNumberE", hle_s2_vi_frameno},
+  {"2nn2vi32GetDefaultDisplayPanelIdentifierE", hle_s2_vi_panel},
+  {"2nn2vi12ListDisplaysE", hle_s2_vi_listdisp},
+  {"2nn2vi21QueryDisplayHdrStatusE", hle_s2_vi_hdrstatus},
+  {"2nn2vi25QueryDisplayHdrPaperWhiteE", hle_s2_vi_paperwhite},
+  {"2nn2vi24QueryDisplayVrrSupportedE", hle_s2_vi_vrr},
+  /* vsync event chain: the generic vi fallback returns x0=0 for every one of
+     these.  TryWait/TimedWait must return TRUE or the game polls forever, and
+     the Get/Duplicate calls must hand back an initialized SystemEventType. */
+  {"2nn2vi20GetDisplayVsyncEventE", hle_s2_vi_vsync},
+  {"2nn3vi23sdk19DuplicateVsyncEventE", hle_s2_vi_vsync},
+  {"2nn2vi6detail14DefaultDisplay19DuplicateVsyncEventE", hle_s2_vi_vsync_mem},
+  {"2nn2vi6detail14DefaultDisplay25DuplicateRefreshRateEventE", hle_s2_vi_vsync_mem},
+  {"2nn2vi6detail14DefaultDisplay23DuplicateHdrStatusEventE", hle_s2_vi_vsync_mem},
+  {"2nn3vi217TryWaitVsyncEventE", hle_s2_vi_vsync_try},
+  {"2nn3vi219TimedWaitVsyncEventE", hle_s2_vi_vsync_try},
+  {"2nn3vi214WaitVsyncEventE", hle_s2_ok},
+  {"2nn3vi215ClearVsyncEventE", hle_s2_ok},
+  {"2nn3vi216CreateVsyncEventE", hle_s2_ok},
+  {"2nn3vi217DestroyVsyncEventE", hle_s2_ok},
+  {"2nn3vi225InitializeMultiWaitHolderE", hle_s2_ok},
+};
+/* Verified Bananza addresses, used only if the symbol scan misses them.  Each
+   carries the mangled substring gsym() must report at that address, so a
+   different dump (OOT) can never lose an unrelated function. */
+static const struct { u64 addr; const char* sym; } g_s2_hook_addrs[]={
+  {0xA851970ull,"BootGraphicsSystem"},        /* nn::gs3sdk::BootGraphicsSystem */
+  {0xA9A7E40ull,"2nn2vi10InitializeE"},       /* nn::vi::Initialize */
+  {0,0}
+};
+
+void swr_install_s2_hooks(void){
+  extern GuestFn* g_disp; extern u64 g_code_lo, g_code_hi;
+  if(!g_mod || !g_disp) return;
+  const int NS=(int)(sizeof(g_s2_hooks)/sizeof(g_s2_hooks[0]));
+  int hits[48]={0}, nvi=0, ncam=0, nvifb=0, nnv=0, nvcensus=0;
+  u64 a_nvn_boot=0;
+  for(u32 i=0;i<g_mod->nentries;i++){
+    u64 a=g_mod->entry_addr[i]; if(a<g_code_lo || a>=g_code_hi) continue;
+    const char* s=gsym(a); if(!s || !s[0]) continue;
+    /* gsym() returns the *nearest* symbol; require an exact match (+0) so a
+       neighbouring exported symbol cannot be hooked by accident. */
+    if(!strstr(s,"+0>")) continue;
+    /* One-pass diagnostics: list every vi / camera export so a differently
+       mangled SDK can be covered from the log without another round trip. */
+    if(strstr(s,"2nn2vi") && nvi++<128)
+      LOG("hle: [S2] vi export %llx (%s)\n",(unsigned long long)a,s);
+    if(strstr(s,"CameraContext") && ncam++<12)
+      LOG("hle: [S2] camera export %llx (%s)\n",(unsigned long long)a,s);
+    int matched=0;
+    for(int k=0;k<NS;k++) if(strstr(s,g_s2_hooks[k].sym)){
+      g_disp[(a-g_code_lo)/4]=g_s2_hooks[k].fn; hits[k]++; matched=1;
+      LOG("hle: [S2] hook %s @ %llx (%s)\n",g_s2_hooks[k].sym,(unsigned long long)a,s); }
+    /* The rest of nn::vi (HDR / VRR / crop / scaling / frame history ...) all
+       return Result OK on the host; cover every export except pure stack value
+       classes (LayerCreationSettings getters/constructors must keep their
+       recompiled code or GetWidth/GetHeight return 0). */
+    if(!matched && strstr(s,"2nn2vi") && !strstr(s,"LayerCreationSettings")){
+      g_disp[(a-g_code_lo)/4]=hle_s2_ok; nvifb++;
+      LOG("hle: [S2] vi fallback %llx (%s) -> stub_ok\n",(unsigned long long)a,s); }
+
+    /* NVN bootstrap loader: main imports it from sdk.  Replacing it keeps the
+       SDK's NVN driver (and the whole nvdrv abort chain) from ever running.
+       nvnBootstrapLoaderInternal is only logged: it may return a table rather
+       than a single function pointer, so stubbing it could break the layout. */
+    if(strstr(s,"nvnBootstrapLoaderInternal")){
+      if(nvcensus++<256) LOG("hle: [S2] nvn export %llx (%s)\n",(unsigned long long)a,s);
+    } else if(strstr(s,"nvnBootstrapLoader")){
+      a_nvn_boot=a;
+      if(nvcensus++<256) LOG("hle: [S2] nvn bootstrap %llx (%s)\n",(unsigned long long)a,s);
+    }
+
+    /* NV driver family.  Six exports double as the NVN null-device slots;
+       they must be classified BEFORE the generic NV stub so their dispatch
+       entries keep the trampoline semantics.  All NV exports are logged so a
+       single run shows the whole surface on this dump. */
+    int is_nvos=strstr(s,"NvOsDrv")!=0;
+    int is_nvrm=strstr(s,"NvRm")!=0;
+    int is_nvn_obj=strstr(s,"nvnInstallGlobalDebugCallback")!=0;
+    if(is_nvos || is_nvrm || is_nvn_obj){
+      if(nvcensus++<256) LOG("hle: [S2] nv export %llx (%s)\n",(unsigned long long)a,s);
+      u64 slot=(a-g_code_lo)/4;
+      if(strstr(s,"NvOsDrvDumpStatusv")){
+        g_nvn_slot_true=a; g_disp[slot]=hle_s2_nvn_true; nnv++;
+        LOG("hle: [S2] nvn slot TRUE  %llx (%s)\n",(unsigned long long)a,s);
+      } else if(strstr(s,"EnableTransferMemTracingv")){
+        g_nvn_slot_zero=a; g_disp[slot]=hle_s2_nvn_zero; nnv++;
+        LOG("hle: [S2] nvn slot ZERO  %llx (%s)\n",(unsigned long long)a,s);
+      } else if(strstr(s,"DisableGpuSemaAcquireTimeoutv")){
+        g_nvn_slot_proc=a; g_disp[slot]=hle_s2_nvn_proc; nnv++;
+        LOG("hle: [S2] nvn slot PROC  %llx (%s)\n",(unsigned long long)a,s);
+      } else if(is_nvn_obj){
+        g_nvn_slot_obj=a; g_disp[slot]=hle_s2_nvn_obj; nnv++;
+        LOG("hle: [S2] nvn slot OBJ   %llx (%s)\n",(unsigned long long)a,s);
+      } else if(strstr(s,"NvRmMemGetSize")){
+        g_nvn_slot_int=a; g_disp[slot]=hle_s2_nvn_int; nnv++;
+        LOG("hle: [S2] nvn slot INT   %llx (%s)\n",(unsigned long long)a,s);
+      } else if(strstr(s,"NvRmMemQueryHeapSize")){
+        g_nvn_slot_size=a; g_disp[slot]=hle_s2_nvn_size; nnv++;
+        LOG("hle: [S2] nvn slot SIZE  %llx (%s)\n",(unsigned long long)a,s);
+      } else if(strstr(s,"NvRmMemPin")){
+        g_nvn_slot_acq=a; g_disp[slot]=hle_s2_nvn_acq; nnv++;
+        LOG("hle: [S2] nvn slot ACQ   %llx (%s)\n",(unsigned long long)a,s);
+      } else if(is_nvos || strstr(s,"MemHandleAlloc") || strstr(s,"MemHandleFree") || strstr(s,"ChannelOpen")){
+        GuestFn fn=hle_s2_nv_ok;
+        if(strstr(s,"GpuGetGpukDevice")) fn=hle_s2_nv_device;
+        else if(strstr(s,"NvOsDrvOpen") || strstr(s,"ChannelOpen")) fn=hle_s2_nv_open;
+        else if(strstr(s,"Ioctl") || strstr(s,"QueryEvent") || strstr(s,"GetStatus") || strstr(s,"FdEntry")) fn=hle_s2_nv_err;
+        else if(strstr(s,"MemHandleAlloc") || strstr(s,"AllocPriv") || strstr(s,"AllocNative")) fn=hle_s2_nv_handle;
+        g_disp[slot]=fn; nnv++; }
+    }
+  }
+  /* Install the NVN takeover only if every required slot was discovered on
+     this dump; otherwise leave the loader alone rather than returning 0. */
+  if(a_nvn_boot && g_nvn_slot_true){
+    g_disp[(a_nvn_boot-g_code_lo)/4]=hle_s2_nvn_bootstrap;
+    LOG("hle: [S2] NVN takeover installed: bootstrap=%llx true=%llx zero=%llx proc=%llx obj=%llx int=%llx size=%llx acq=%llx\n",
+        (unsigned long long)a_nvn_boot,(unsigned long long)g_nvn_slot_true,
+        (unsigned long long)g_nvn_slot_zero,(unsigned long long)g_nvn_slot_proc,
+        (unsigned long long)g_nvn_slot_obj,(unsigned long long)g_nvn_slot_int,
+        (unsigned long long)g_nvn_slot_size,(unsigned long long)g_nvn_slot_acq);
+  } else {
+    LOG("hle: [S2] NVN takeover NOT installed: bootstrap=%llx true=%llx\n",
+        (unsigned long long)a_nvn_boot,(unsigned long long)g_nvn_slot_true);
+  }
+  LOG("hle: [S2] NV family: %d exports logged, %d taken over\n",nvcensus,nnv);
+  int nhit=0;
+  for(int k=0;k<NS;k++){
+    if(!hits[k]) LOG("hle: [S2] hook %s NOT FOUND by symbol\n",g_s2_hooks[k].sym);
+    else nhit++; }
+  LOG("hle: [S2] installed: %d/%d explicit hooks, %d vi fallbacks, %d vi exports, %d camera exports\n",
+      nhit,NS,nvifb,nvi,ncam);
+  for(int j=0;g_s2_hook_addrs[j].addr;j++){ u64 a=g_s2_hook_addrs[j].addr;
+    if(a<g_code_lo || a>=g_code_hi) continue;
+    const char* s=gsym(a);
+    /* Never patch a hard-coded address on a different dump: the symbol must
+       still agree, otherwise OOT could lose an unrelated function. */
+    if(!s || !strstr(s,g_s2_hook_addrs[j].sym)){
+      LOG("hle: [S2] addr fallback %llx skipped (%s)\n",(unsigned long long)a,s?s:"?"); continue; }
+    LOG("hle: [S2] addr fallback %llx (%s) -> stub_ok\n",(unsigned long long)a,s);
+    g_disp[(a-g_code_lo)/4]=hle_s2_ok; }
+  /* Bananza Switch 2 nn::oe graphics scale mode helper at 0xa966700:
+     verifies `cmp w0, #10` (0x7100281f) at +0x10 and `cmp w0, #30` (0x7100781f)
+     at +0x18 before hooking to hle_s2_true (returns 1 = Docked / 20). */
+  if(0xa966700ull>=g_code_lo && 0xa966720ull<g_code_hi &&
+     s2_guest_ok(0xa966710ull,12) &&
+     gr32(0xa966710ull)==0x7100281fu && gr32(0xa966718ull)==0x7100781fu){
+    g_disp[(0xa966700ull-g_code_lo)/4]=hle_s2_true;
+    LOG("hle: [S2] hooked nn::oe graphics scale mode @ a966700 -> 1 (Docked)\n");
+  }
+  /* shader-reflection null-pointer guard: hook 0x884f2c0 only when its prologue
+     still matches this dump's binary (pacibsp + ldr x22,[x0,#0xd8] at +0x1c), so
+     OOT or a different build never loses an unrelated function.  The guarded fn
+     reads a material-stage reflection object from x0 and crashes on a null /
+     sentinel pointer; we return -1 (not-found) instead and run the real fn when
+     x0 is a valid mapping. */
+  if(0x884f2c0ull>=g_code_lo && 0x884f2c0ull<g_code_hi &&
+     gr32(0x884f2c0ull)==0xd503237fu && gr32(0x884f2c0ull+0x1c)==0xf9406c16u){
+    u64 slot=(0x884f2c0ull-g_code_lo)/4;
+    g_s2_orig_gfb=g_disp[slot];
+    g_disp[slot]=hle_s2_gfb;
+    LOG("hle: [S2] hooked shader-reflection lookup @ 884f2c0 (x0-guard -> -1)\n");
+  }
+  /* material-stage reflection helper at 0x99a6350: see hle_s2_refl above.  The
+     first call's [x0,#0x1c] (stage count) must read 0 to skip the loop, so we
+     return the zero-filled NVN scratch object on every call.  Guard on the
+     interpreter-trampoline prologue (adrp 0xf00041f0): only hook when this
+     address is the un-recompiled trampoline that crashes, never a real
+     recompiled function on a different build / dump. */
+  if(0x99a6350ull>=g_code_lo && 0x99a6350ull<g_code_hi &&
+     gr32(0x99a6350ull)==0xf00041f0u){
+    u64 slot=(0x99a6350ull-g_code_lo)/4;
+    g_s2_orig_refl=g_disp[slot];
+    g_disp[slot]=hle_s2_refl;
+    LOG("hle: [S2] hooked shader-reflection helper @ 99a6350 (-> scratch, loop skip) sym=%s\n",
+        gsym(0x99a6350ull)? gsym(0x99a6350ull): "?");
+  }
+  /* Root mitigation for the recurring "unbound NVN object sentinel" crash class.
+     The game keeps a FIXED sentinel pointer (0x10000000101, identical across every
+     run) for NVN objects it never created, and dereferences it directly (e.g.
+     [x+0x18]) -- that guest page is unmapped, so it faults.  Mapping a zero-filled
+     RW page there makes every such deref read 0 instead of crashing.  This covers
+     ALL call sites at once (the material-stage reflection loop at 0x8864708 /
+     99a6350, the shader-reflection lookup at 884f2c0, and any future one) without
+     depending on a per-address dispatch hook that the JIT later overwrites.
+     Address note: 0x10000000000 == 64 GiB.  In Bananza's 39-bit layout the alias
+     logical window is [12 GiB, 76 GiB) (ALIAS_BASE=0x300000000, g_alias_size=64G),
+     so this page sits *inside* that window -- but the window is only backed per page
+     when the guest actually maps/aliases an address, and the crash at 0x10000000119
+     proved this page was unbacked (hence free).       mem_map therefore claims it
+     cleanly with no real allocation to collide with.  We cannot pick another
+     address: 0x10000000101 is a fixed SDK magic constant, so we must map exactly
+     the page that contains it.
+     IMPORTANT: by the time this runs the guest has already registered a MemBlock
+     that *covers* 64 GiB (so mem_map's mem_is_free() check rejects the request
+     and the original mem_map() call failed with "could not map").  That is fine:
+     the block list is only metadata for svcQueryMemory -- actual guest access is
+     gated purely by whether the host page is committed (RW), exactly like page 0
+     in mem_init().  So we bypass the block-list check and commit the host page
+     directly, which is what makes the deref read 0 instead of SIGSEGV'ing. */
+  {
+    u8* sp = GP(0x10000000000ull);
+    if(plat_vm_commit(sp, 0x2000ull)==0)
+      LOG("hle: [S2] committed unbound-NVN-sentinel page @ 10000000000 (2 pages, zero)\n");
+    else
+      WARN("hle: [S2] could not commit unbound-NVN-sentinel page @ 10000000000\n");
+  }
+}
 
 static void guest_backtrace(CPU* c){
   WARN("  pc=%llx lr=%llx sp=%llx fp=%llx\n",(unsigned long long)c->pc,(unsigned long long)c->x[30],(unsigned long long)c->x[31],(unsigned long long)c->x[29]);
@@ -625,6 +1540,17 @@ static void dump_unresolved(void){
 }
 
 static void kernel_dump_code(u64 ra);
+
+/* One-shot full census from the crash path.  svcBreak and the 12 s frontend
+   dump are both too late for a SIGSEGV at ~1.9 s: without this, every host
+   crash loses the whole remaining SVC / IPC / unresolved-import surface and
+   the next run only reveals ONE more missing command. */
+void kernel_crash_census(void){
+  svc_dump_census();
+  ipc_dump_stats();
+  dump_unresolved();
+}
+
 void kernel_dump_regs(CPU* c){
   if(c->pc<0x1000 || getenv("SWR_UNRES")) dump_unresolved();
   for(int i=0;i<31;i+=4) WARN("  x%-2d=%016llx x%-2d=%016llx x%-2d=%016llx x%-2d=%016llx\n",i,(unsigned long long)c->x[i],i+1,(unsigned long long)c->x[i+1],i+2,(unsigned long long)c->x[i+2],i+3,(unsigned long long)(i+3<32?c->x[i+3]:0));
@@ -691,6 +1617,7 @@ void swr_svc(CPU* c, u32 imm){
 static void swr_svc_(CPU* c, u32 imm){
   KThread* t=kthread_cur();
   u64* x=c->x;
+  if(imm<256) __atomic_fetch_add(&g_svc_n[imm],1,__ATOMIC_RELAXED);
   switch(imm){
   case 0x01: { u64 a=mem_heap_set(x[1]); if(!a && x[1]){ x[0]=R_OUTOFMEM; return; } x[0]=0; x[1]=HEAP_BASE; return; }
   case 0x02: mem_set_state(x[0],x[1],0xFFFFFFFFu,(u32)x[2]); x[0]=0; return;
@@ -754,7 +1681,24 @@ static void swr_svc_(CPU* c, u32 imm){
     u32 reason=(u32)x[0];
     if(reason&0x80000000u){ LOGV("svcBreak (notice) %x\n",reason); x[0]=0; return; }
     WARN("\n*** The game called svcBreak (reason=%x, info=%llx size=%llx) ***\n",reason,(unsigned long long)x[1],(unsigned long long)x[2]);
-    if(x[1] && x[2]>=4 && x[2]<0x1000){ u8 tmp[64]; memcpy(tmp,GP(x[1]),x[2]<64?x[2]:64); WARN("  data: "); for(u64 i=0;i<(x[2]<64?x[2]:64);i++) WARN("%02x",tmp[i]); WARN("\n"); }
+    if(x[1] && x[2]>=4 && x[2]<0x1000){
+      u8 tmp[64]; u64 n=x[2]<64?x[2]:64; memcpy(tmp,GP(x[1]),n);
+      WARN("  data: "); for(u64 i=0;i<n;i++) WARN("%02x",tmp[i]); WARN("\n");
+      /* svcBreak info usually points at a little-endian nn::Result.  Print it
+         decoded: a bare hex dump made 0x30af3 (graphics service not
+         initialized) look like an anonymous crash for several runs. */
+      u32 r=(u32)tmp[0]|((u32)tmp[1]<<8)|((u32)tmp[2]<<16)|((u32)tmp[3]<<24);
+      static const struct { u32 v; const char* what; } known[]={
+        {0x00030AF3u,"graphics service / NVN device not initialized"},
+        {0x002EE202u,"nn::fs::ResultInvalidArgument"},
+      };
+      const char* what="(unknown Result)";
+      for(unsigned j=0;j<sizeof known/sizeof known[0];j++) if(known[j].v==r) what=known[j].what;
+      WARN("  nn::Result = 0x%08x  %s\n",r,what); }
+    /* the service surface first: a NULL interface from a stubbed applet command
+       is what makes nnSdk panic later, far away from the actual gap */
+    svc_dump_census();
+    ipc_dump_stats();
     kernel_dump_regs(c);
     /* strings pointed to by regs, often the abort message */
     for(int r=0;r<31;r++){ u64 a=c->x[r]; if(a<0x10000 || a>=AS_SIZE-256) continue; MemBlock b; mem_query(a,&b);
@@ -785,9 +1729,9 @@ static void swr_svc_(CPU* c, u32 imm){
     u8* p=GP(x[0]); memset(p,0,0x320); memcpy(p,n->cpu.x,29*8); memcpy(p+29*8,&n->cpu.x[29],8); memcpy(p+30*8,&n->cpu.x[30],8);
     memcpy(p+31*8,&n->cpu.x[31],8); memcpy(p+32*8,&n->cpu.pc,8); memcpy(p+0x110,n->cpu.v,0x200); x[0]=0; return; }
   case 0x34: { u64 a=x[0]; i32 b=(a&3)? 0 : (i32)gr32(a); arb_note('w',t,a,(u32)x[1],(i32)(u32)x[2],(i64)x[3],0,b,0);
-    x[0]=svc_wait_addr(t,a,(u32)x[1],(i32)(u32)x[2],(i64)x[3]); arb_note('W',t,a,(u32)x[1],(i32)(u32)x[2],(i64)x[3],(u32)x[0],b,0); return; }
+    x[0]=svc_wait_addr(t,a,(u32)x[1],(u64)x[2],(i64)x[3]); arb_note('W',t,a,(u32)x[1],(i32)(u32)x[2],(i64)x[3],(u32)x[0],b,0); return; }
   case 0x35: { u64 a=x[0]; i32 b=(a&3)? 0 : (i32)gr32(a); pm_lock(&g_klock); int nw=wl_count(4,a); pm_unlock(&g_klock);
-    x[0]=svc_signal_addr(a,(u32)x[1],(i32)(u32)x[2],(i32)(u32)x[3]); arb_note('S',t,a,(u32)x[1],(i32)(u32)x[2],(i32)(u32)x[3],(u32)x[0],b,nw); return; }
+    x[0]=svc_signal_addr(a,(u32)x[1],(u64)x[2],(i32)(u32)x[3]); arb_note('S',t,a,(u32)x[1],(i32)(u32)x[2],(i32)(u32)x[3],(u32)x[0],b,nw); return; }
   case 0x45: { KEvent* e=kevent_new("user event",0); u32 w=h_new(&e->o), r=h_new(&e->o); x[0]=0; x[1]=w; x[2]=r; return; }
   case 0x4B: { x[0]=R_NOTIMPL; return; }
   case 0x6F: { /* GetSystemInfo(type, handle, subtype). newer SDKs abort on boot if this returns 0 */
@@ -823,10 +1767,43 @@ static int host_to_guest(u64 rip, u64* ga, u64* off){
   if(!best) return 0; *ga=g; *off=rip-best; return 1; }
 
 static void sample_thread(KThread* t){
-  void* h=__atomic_load_n(&t->host,__ATOMIC_ACQUIRE); if(!h) return;
+  void* h=__atomic_load_n(&t->host,__ATOMIC_ACQUIRE);
   u64 pcs[64]; int n=0;
-  for(int k=0;k<64;k++){ u64 pc; if(plat_thread_pc(h,&pc)) pcs[n++]=pc; plat_sleep_ns(2000000); }
-  if(!n) return;
+  if(h){
+    for(int k=0;k<64;k++){ u64 pc; if(plat_thread_pc(h,&pc)) pcs[n++]=pc; plat_sleep_ns(2000000); }
+  }
+  if(!n){
+    /* On PS5 plat_thread_pc returns 0 (no host RIP sampler), so a running
+       thread used to produce no live register or code dump at all -- only its
+       stale t->sleep_x from an earlier SleepThread call.  Dump the live CPU
+       state and 192 words around c->pc and c->x[30] directly. */
+    u64 pc=t->cpu.pc, lr=t->cpu.x[30];
+    LOG("    thread %llu: live guest state (host PC sampling unavailable): pc=%llx%s lr=%llx%s sp=%llx fp=%llx\n",
+        (unsigned long long)t->id,(unsigned long long)pc,gsym(pc),(unsigned long long)lr,gsym(lr),
+        (unsigned long long)t->cpu.x[31],(unsigned long long)t->cpu.x[29]);
+    LOG("    live regs:");
+    for(int r=0;r<31;r++) LOG("%s x%d=%llx",(r%6==0)?"\n     ":"",r,(unsigned long long)t->cpu.x[r]);
+    LOG("\n");
+    for(int r=0;r<29;r++){
+      u64 a=t->cpu.x[r]&~7ull; MemBlock b; if(a<AS_BASE || a>=AS_SIZE) continue; mem_query(a,&b);
+      if(b.state==MS_FREE || b.state==MS_INACCESSIBLE || !(b.perm&1)) continue;
+      LOG("    live mem x%d [%llx]:",r,(unsigned long long)a);
+      for(int j=0;j<8 && a+j*8+8<=b.addr+b.size;j++) LOG(" %llx",(unsigned long long)gr64(a+j*8));
+      LOG("\n");
+    }
+    u64 hot=pc&~3ull;
+    if(hot>=AS_BASE && hot<AS_SIZE){
+      MemBlock b; mem_query(hot,&b);
+      if(b.state!=MS_FREE && b.state!=MS_INACCESSIBLE && (b.perm&1)){
+        u64 a = hot>b.addr+0x100 ? hot-0x100 : b.addr;
+        LOG("    live code around pc (%llx) from %llx:",(unsigned long long)hot,(unsigned long long)a);
+        for(int i=0;i<192 && a+i*4<b.addr+b.size;i++) LOG("%s%08x",(i%16==0)?"\n     ":" ",gr32(a+i*4));
+        LOG("\n");
+      }
+    }
+    if((lr&~3ull) && (lr&~3ull)!=hot) kernel_dump_code(lr);
+    return;
+  }
   struct { u64 ga, lo, hi; char mod[48]; int c; } H[16]; int nh=0;
   for(int k=0;k<n;k++){ u64 ga=0, off=0; char mod[48]=""; int g=host_to_guest(pcs[k],&ga,&off);
     if(!g){ if(!plat_addr_module(pcs[k],mod,sizeof mod,&off)){ snprintf(mod,sizeof mod,"?"); off=pcs[k]; } off&=~0x3Full; }
@@ -871,7 +1848,9 @@ void kernel_dump_threads(void){
   /* threads spinning on SleepThread: dump regs + nearby code */
   { {
     for(int i=0;i<g_nthreads;i++){ KThread* t=g_threads[i]; if(!t || t->state==2 || t->wait_kind!=0 || !t->sleep_n) continue;
-      LOG("thread %llu looping on SleepThread (%llu times) from lr=%llx\n    regs:",(unsigned long long)t->id,(unsigned long long)t->sleep_n,(unsigned long long)t->sleep_lr);
+      LOG("thread %llu %s on SleepThread (%llu times) from lr=%llx (now pc=%llx)\n    regs:",
+          (unsigned long long)t->id,t->sleep_n>1?"looping":"past",(unsigned long long)t->sleep_n,
+          (unsigned long long)t->sleep_lr,(unsigned long long)t->cpu.pc);
       for(int r=0;r<31;r++) LOG("%s x%d=%llx",(r%6==0)?"\n     ":"",r,(unsigned long long)t->sleep_x[r]);
       LOG("\n");
       for(int r=0;r<31;r++){ u64 a=t->sleep_x[r]&~7ull; MemBlock b; if(a<AS_BASE || a>=AS_SIZE) continue; mem_query(a,&b);
@@ -907,7 +1886,9 @@ void kernel_dump_threads(void){
       u64 fp=t->cpu.x[29], ras[4]; int nra=0; ras[nra++]=t->sleep_lr;
       for(int j=0;j<3 && fp>=AS_BASE && fp<AS_SIZE && !(fp&7);j++){ MemBlock b; mem_query(fp,&b); if(b.state==MS_FREE || b.state==MS_INACCESSIBLE) break; ras[nra++]=gr64(fp+8); fp=gr64(fp); }
       for(int j=0;j<nra;j++) kernel_dump_code(ras[j]); }
-    KThread* m=g_main; if(m){ u64 fp=m->cpu.x[29]; for(int j=0;j<4 && fp>=AS_BASE && fp<AS_SIZE && !(fp&7);j++){ MemBlock b; mem_query(fp,&b); if(b.state==MS_FREE || b.state==MS_INACCESSIBLE) break; kernel_dump_code(gr64(fp+8)); fp=gr64(fp); } } } }
+    KThread* m=g_main; if(m){
+      if(m->cpu.pc) kernel_dump_code(m->cpu.pc);
+      u64 fp=m->cpu.x[29]; for(int j=0;j<4 && fp>=AS_BASE && fp<AS_SIZE && !(fp&7);j++){ MemBlock b; mem_query(fp,&b); if(b.state==MS_FREE || b.state==MS_INACCESSIBLE) break; kernel_dump_code(gr64(fp+8)); fp=gr64(fp); } } } }
   /* address waits: the last arbiter calls on each address (w=wait starts, W=wait returns, S=signal, before/after =
      the word in memory around the call) and the memory around it */
   { u64 seen[64]; int ns=0;
@@ -945,5 +1926,40 @@ void kernel_dump_threads(void){
         LOG("    %02x %llx %llx %llx %llx -> %x %llx  lr=%llx\n",r->imm,(unsigned long long)r->a[0],(unsigned long long)r->a[1],(unsigned long long)r->a[2],(unsigned long long)r->a[3],r->res,(unsigned long long)r->o1,(unsigned long long)r->lr); }
       LOG("  last IPCs:\n");
       for(u32 qn_=g_ipc_ring_n, q=qn_>32? qn_-32 : 0; q<qn_; q++) LOG("    %s\n",g_ipc_ring[q&31]); } }
+  /* ---- hang censuses: which KEvent is never signalled, and the exact fields
+         the SleepThread poll loop is waiting on.  One run exposes the whole
+         surface instead of guessing one event at a time. -------------------- */
+  if(g_dump_sample){
+    int tot=0, unsig=0, shown=0;
+    LOG("kernel event census:\n");
+    pm_lock(&g_klock);
+    for(int i=1;i<MAXH;i++){
+      KObj* o=htab[i]; if(!o || o->type!=KO_EVENT) continue;
+      KEvent* e=(KEvent*)o; tot++;
+      if(e->signaled) continue;
+      unsig++;
+      if(shown++<64) LOG("  UNSIGNALED h=%x %-22s autoclear=%d waiters=%d\n",
+          ((u32)hgen[i]<<15)|(u32)i, o->name? o->name : "?", e->autoclear, o->nwait);
+    }
+    pm_unlock(&g_klock);
+    LOG("kernel event census: %d events, %d still clear\n",tot,unsig);
+  }
+  if(g_dump_sample && g_main && g_main->sleep_n){
+    u64 o=g_main->sleep_x[19];
+    if(o>=AS_BASE && o<AS_SIZE){
+      MemBlock b; mem_query(o,&b);
+      if(b.state!=MS_FREE && b.state!=MS_INACCESSIBLE && (b.perm&1)){
+        u64 p=gr64(o+56);
+        LOG("wait-cond: x19=%llx flag(+0x50)=%x member(+0x38)=%llx\n",
+            (unsigned long long)o,(unsigned)gr32(o+80),(unsigned long long)p);
+        if(p>=AS_BASE && p<AS_SIZE){
+          MemBlock pb; mem_query(p,&pb);
+          if(pb.state!=MS_FREE && pb.state!=MS_INACCESSIBLE && (pb.perm&1))
+            LOG("wait-cond: member[+0x120]=%llx (loop exits when this or the flag is non-zero)\n",
+                (unsigned long long)gr64(p+288));
+        }
+      }
+    }
+  }
   LOG("---------------------------------------\n"); fflush(NULL);
 }

@@ -5,18 +5,69 @@
    to normal folders */
 #include "rt.h"
 #include <ctype.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+
+/* fsync-backed diagnostic sink defined in plat.c (independent of the buffered
+   log, so it survives a hard crash); declared here for the romfs tracers. */
+extern void romfs_diag(const char*);
 
 #define FS_NOTFOUND RC(2,1)
 #define FS_EXISTS   RC(2,2)
 
 /* ============================================================ RomFS virtual */
-typedef struct { char* path; u64 off, size; int logged; } RFile;
+#include "nup_ps5.h"
+
+/* Heap-free large allocators (anonymous mmap on PS5, plain mmap on the host).
+   The RomFS index for a real game holds ~78k nodes and ~16 MB of tables; the
+   PS5 CRT heap cannot grow that far, so every big buffer here MUST come from
+   ps5_alloc_large, never malloc/calloc/realloc/strdup.  See
+   docs/ps5_splash_hang_analysis.md (root cause 2). */
+extern void* ps5_alloc_large(u64 size);
+extern void  ps5_free_large(void* p, u64 size);
+
+/* Bump-allocated string arena: every file/dir name gets a slice of one big
+   mmap region instead of a CRT-heap strdup().  NULL => fall back to strdup
+   (used by the flat-folder fallback path, which is host-only). */
+static char* g_name_arena;
+static u64   g_name_pos;
+static u64   g_name_cap;
+static int   g_name_overflow;          /* set once if the arena ever runs short */
+static char  g_name_empty[1] = "";
+static char* store_name(const char* s){
+  if(g_name_arena){
+    size_t L = strlen(s);
+    if(g_name_pos + L + 1 > g_name_cap){
+      /* NEVER hand back the caller's buffer here: nup_scan passes a stack
+         scratch (char nm[1536]), so that pointer would dangle as soon as the
+         frame returns and every node would alias a dead local. Give out one
+         shared empty string instead, and log once (a per-node log with fsync
+         slowed the scan from <1 s to >60 s). romfs_build_nup sizes the arena
+         exactly from nup_name_bytes(), so this should never trigger. */
+      if(!g_name_overflow++)
+        LOG("RomFS: name arena overflow (used %llu of %llu) - names truncated\n",
+            (unsigned long long)g_name_pos, (unsigned long long)g_name_cap);
+      return g_name_empty;
+    }
+    char* p = g_name_arena + g_name_pos;
+    memcpy(p, s, L + 1);
+    g_name_pos += L + 1;
+    g_name_pos = (g_name_pos + 7) & ~(u64)7;   /* keep 8-byte alignment */
+    return p;
+  }
+  return strdup(s);
+}
+
+typedef struct { const char* path; u64 off, size; int logged; int nup_node; u64 extent_offset, extent_size; int codec; } RFile;
 
 static size_t g_romdir_len;
 static RFile* rfiles; static int nrfiles;
-static u8* rmeta; static u64 rmeta_size;        /* header + tables sit at the start of the image */
+static u8* rmeta; static u64 rmeta_size;
 static u64 rdata_off, rtotal;
-static FILE* rraw;                               /* plain romfs.bin */
+static FILE* rraw;
 
 char g_romfs_dir_override[1024];
 
@@ -27,25 +78,43 @@ static PMutex g_romlock;
 
 typedef struct DNode { char* name; int parent; int first_child, next_sib, first_file; u32 off; } DNode;
 
-typedef struct FNode { char* name; int parent, next_sib; u32 off; u64 size; char* host; } FNode;
+typedef struct FNode { char* name; int parent, next_sib; u32 off; u64 size; int nup_node; } FNode;
 
 static DNode* dn; static int ndn, capdn; static FNode* fn; static int nfn, capfn;
 
-static int add_dir(const char* name, int parent){ if(ndn==capdn){ capdn=capdn?capdn*2:256; dn=realloc(dn,sizeof(DNode)*capdn); }
-  DNode* d=&dn[ndn]; d->name=strdup(name); d->parent=parent; d->first_child=-1; d->next_sib=-1; d->first_file=-1; return ndn++; }
+/* capdn/capfn > 0  => CRT-heap realloc growth (flat-folder fallback path).
+   capdn/capfn <= 0 => arrays were preallocated via ps5_alloc_large; never grow. */
+static void grow_dn(void){
+  if(capdn <= 0){ LOG("RomFS: DIR index capacity exceeded (capdn=%d)\n", capdn); return; }
+  int ncap = capdn ? capdn*2 : 256;
+  DNode* nd = (DNode*)realloc(dn, sizeof(DNode)*ncap);
+  if(!nd){ LOG("RomFS: dn realloc failed\n"); return; }
+  dn = nd; capdn = ncap;
+}
+static void grow_fn(void){
+  if(capfn <= 0){ LOG("RomFS: FILE index capacity exceeded (capfn=%d)\n", capfn); return; }
+  int ncap = capfn ? capfn*2 : 1024;
+  FNode* nf = (FNode*)realloc(fn, sizeof(FNode)*ncap);
+  if(!nf){ LOG("RomFS: fn realloc failed\n"); return; }
+  fn = nf; capfn = ncap;
+}
 
-static int add_file(const char* name, int parent, u64 size, const char* host){ if(nfn==capfn){ capfn=capfn?capfn*2:1024; fn=realloc(fn,sizeof(FNode)*capfn); }
-  FNode* f=&fn[nfn]; f->name=strdup(name); f->parent=parent; f->next_sib=-1; f->size=size; f->host=strdup(host); return nfn++; }
+static int add_dir(const char* name, int parent){ if(ndn==capdn) grow_dn();
+  DNode* d=&dn[ndn]; d->name=store_name(name); d->parent=parent; d->first_child=-1; d->next_sib=-1; d->first_file=-1; return ndn++; }
+
+static int add_file(const char* name, int parent, u64 size, int nup_node){ if(nfn==capfn) grow_fn();
+  FNode* f=&fn[nfn]; f->name=store_name(name); f->parent=parent; f->next_sib=-1; f->size=size; f->nup_node=nup_node; return nfn++; }
 
 static int cmpname(const void* a, const void* b){ return strcmp(*(char* const*)a,*(char* const*)b); }
 
 static void scan(const char* host, int di){
-  PDir d; if(plat_dir_open(&d,host)) return;
+  static int depth; depth++;
+  if(depth>300){ depth--; return; }
+  PDir d; if(plat_dir_open(&d,host)){ depth--; return; }
   char** names=NULL; int* isdir=NULL; u64* sizes=NULL; int n=0, cap=0;
   while(plat_dir_next(&d)){ if(n==cap){ cap=cap?cap*2:64; names=realloc(names,sizeof(char*)*cap); isdir=realloc(isdir,sizeof(int)*cap); sizes=realloc(sizes,8*cap); }
     names[n]=strdup(d.name); isdir[n]=d.is_dir; sizes[n]=d.size; n++; }
   plat_dir_close(&d);
-  /* dirs first, then alphabetical, so the layout is stable */
   for(int pass=0;pass<2;pass++){
     int lastd=-1, lastf=-1;
     char** idx=malloc(sizeof(char*)*(n?n:1)); int m=0;
@@ -54,10 +123,11 @@ static void scan(const char* host, int di){
     for(int k=0;k<m;k++){ int i=0; while(names[i]!=idx[k]) i++;
       char p[2048]; snprintf(p,sizeof p,"%s/%s",host,names[i]);
       if(pass==0){ int c=add_dir(names[i],di); if(lastd<0) dn[di].first_child=c; else dn[lastd].next_sib=c; lastd=c; scan(p,c); }
-      else { int f=add_file(names[i],di,sizes[i],p); if(lastf<0) dn[di].first_file=f; else fn[lastf].next_sib=f; lastf=f; } }
+      else { int f=add_file(names[i],di,sizes[i],-1); if(lastf<0) dn[di].first_file=f; else fn[lastf].next_sib=f; lastf=f; } }
     free(idx);
   }
   for(int i=0;i<n;i++) free(names[i]); free(names); free(isdir); free(sizes);
+  depth--;
 }
 
 static u32 rhash(u32 parent, const char* s){ u32 h=parent^123456789u; for(;*s;s++){ h=(h>>5)|(h<<27); h^=(u8)*s; } return h; }
@@ -66,25 +136,36 @@ static u32 hcount(u32 n){ if(n<3) return 3; if(n<19) return n|1; u32 c=n; while(
 
 static int rf_cmp(const void* a, const void* b){ const RFile* x=a,*y=b; return x->off<y->off? -1 : x->off>y->off; }
 
-static void romfs_build(const char* dir){
-  add_dir("",0); dn[0].parent=0; g_romdir_len=strlen(dir);
-  scan(dir,0);
-  /* table offsets */
+/* Write the RomFS image metadata (rmeta) and the runtime file index (rfiles)
+   from the populated dn[]/fn[] trees. Shared by the flat-folder path (scan) and
+   the NUP path (nup_scan). */
+static void finalize_romfs(void){
   u32 doff=0; for(int i=0;i<ndn;i++){ dn[i].off=doff; doff+=0x18+((strlen(dn[i].name)+3)&~3u); }
   u32 foff=0; for(int i=0;i<nfn;i++){ fn[i].off=foff; foff+=0x20+((strlen(fn[i].name)+3)&~3u); }
   u32 dhc=hcount(ndn), fhc=hcount(nfn);
   u64 hdr=0x50, dht=hdr, dmt=dht+dhc*4, fht=dmt+doff, fmt=fht+fhc*4, end=fmt+foff;
   rdata_off=(end+0x1FF)&~0x1FFull;
-  rmeta_size=rdata_off; rmeta=calloc(1,rmeta_size);
+  rmeta_size=rdata_off; rmeta=(u8*)ps5_alloc_large(rmeta_size);
+  if(!rmeta){ LOG("RomFS: rmeta alloc failed\n"); return; }
   u64 H[10]={0x50,dht,dhc*4ull,dmt,doff,fht,fhc*4ull,fmt,foff,rdata_off}; memcpy(rmeta,H,0x50);
   u32* dh=(u32*)(rmeta+dht); for(u32 i=0;i<dhc;i++) dh[i]=0xFFFFFFFFu;
   u32* fh=(u32*)(rmeta+fht); for(u32 i=0;i<fhc;i++) fh[i]=0xFFFFFFFFu;
   u64 data=0;
-  rfiles=calloc(nfn?nfn:1,sizeof(RFile));
-  for(int i=0;i<nfn;i++){ fn[i].size=fn[i].size; data=(data+0xF)&~0xFull;
-    /* an empty file has the same offset as the next one, if we list it romfs_read finds it instead and reads the
-       real file back as padding (zeros). it never gets read anyway */
-    if(fn[i].size){ rfiles[nrfiles].path=fn[i].host; rfiles[nrfiles].off=rdata_off+data; rfiles[nrfiles].size=fn[i].size; nrfiles++; }
+  rfiles=(RFile*)ps5_alloc_large((nfn?nfn:1)*sizeof(RFile));
+  if(!rfiles){ LOG("RomFS: rfiles alloc failed\n"); return; }
+  for(int i=0;i<nfn;i++){
+    /* MUST be a 64-bit mask: "~0xFu" is an unsigned int, so & against it
+       zeroed the high 32 bits of `data` on every iteration.  Bananza has
+       9,152,723,867 bytes of file data; the wrap made rtotal 542 MB while
+       the file table still advertised offsets past it, so nn::fs::ReadFile
+       got RC(2,6001)=0x2EE202 (ResultInvalidArgument) and aborted. */
+    data=(data+0xF)&~0xFull;
+    if(fn[i].size){
+      RFile* r=&rfiles[nrfiles];
+      r->path=fn[i].name; r->off=rdata_off+data; r->size=fn[i].size; r->nup_node=fn[i].nup_node;
+      if(r->nup_node>=0) nup_file_extent(r->nup_node,&r->extent_offset,&r->extent_size,&r->codec);
+      nrfiles++;
+    }
     u8* e=rmeta+fmt+fn[i].off; u32 w[2]={dn[fn[i].parent].off, fn[i].next_sib>=0? fn[fn[i].next_sib].off : 0xFFFFFFFFu};
     memcpy(e,w,8); memcpy(e+8,&data,8); memcpy(e+16,&fn[i].size,8);
     u32 h=rhash(dn[fn[i].parent].off,fn[i].name)%fhc; u32 nl=(u32)strlen(fn[i].name);
@@ -97,22 +178,152 @@ static void romfs_build(const char* dir){
     memcpy(e+16,&dh[h],4); dh[h]=dn[i].off; memcpy(e+20,&nl,4); memcpy(e+24,dn[i].name,nl); }
   rtotal=rdata_off+data;
   qsort(rfiles,nrfiles,sizeof(RFile),rf_cmp);
-  LOG("RomFS: %d folders, %d files, %.1f MB\n",ndn,nfn,(double)rtotal/1048576.0);
+  LOG("RomFS: %d folders, %d files, data=%llu rdata_off=%llu rtotal=%llu (%.1f MB)\n",
+      ndn,nfn,(unsigned long long)data,(unsigned long long)rdata_off,
+      (unsigned long long)rtotal,(double)rtotal/1048576.0);
 }
+
+static void romfs_build(const char* dir){
+  add_dir("",0); dn[0].parent=0; g_romdir_len=strlen(dir);
+  scan(dir,0);
+  finalize_romfs();
+}
+
+/* ---- NUP-backed romfs construction (no flat folder / manifest) ---- */
+static int nup_node_cmp(const void* a, const void* b){
+  int na=*(const int*)a, nb=*(const int*)b;
+  int da=nup_node_is_dir(na), db=nup_node_is_dir(nb);
+  if(da!=db) return db-na; /* directories first, then files */
+  char an[1536], bn[1536]; nup_node_name(na,an,sizeof an); nup_node_name(nb,bn,sizeof bn);
+  return strcmp(an,bn);
+}
+static void nup_scan(int dir_node, int di){
+  int nchild=nup_dir_child_count(dir_node);
+  /* Transient per-directory scratch: small and freed on return. The big RomFS
+     index now lives in heap-free mmap, so the CRT heap is free and a short-lived
+     malloc here is safe (and avoids 2 MiB-granule mmap + per-alloc logging for
+     each of the ~2.9k directories). */
+  int* kids=(int*)malloc(sizeof(int)*(nchild?nchild:1));
+  if(!kids){ LOG("RomFS: kids alloc failed (n=%d)\n", nchild); return; }
+  for(int i=0;i<nchild;i++) kids[i]=nup_dir_child(dir_node,i);
+  qsort(kids,(size_t)nchild,sizeof(int),nup_node_cmp);
+  int lastd=-1, lastf=-1;
+  for(int k=0;k<nchild;k++){
+    int node=kids[k]; char nm[1536]; nup_node_name(node,nm,sizeof nm);
+    if(nup_node_is_dir(node)){ int c=add_dir(nm,di); if(lastd<0) dn[di].first_child=c; else dn[lastd].next_sib=c; lastd=c; nup_scan(node,c); }
+    else { u64 fsz=0; nup_file_size(node,&fsz); int f=add_file(nm,di,fsz,node); if(lastf<0) dn[di].first_file=f; else fn[lastf].next_sib=f; lastf=f; }
+  }
+  free(kids);
+}
+static int romfs_build_nup(void){
+  int root=nup_base_romfs_dir();
+  if(root<0){ LOG("RomFS: no romfs directory in NUP\n"); return 0; }
+  int total = nup_node_count();
+  if(total<=0){ LOG("RomFS: empty NUP node count\n"); return 0; }
+  /* Preallocate the whole index on heap-free (mmap) memory. The container holds
+     ~78k nodes; doing this on the tiny PS5 CRT heap would exhaust it and
+     deadlock the console (see docs/ps5_splash_hang_analysis.md, root cause 2).
+     capdn/capfn = -1 disables the CRT-heap realloc growth path in add_dir/add_file. */
+  capdn=-1; capfn=-1; dn=NULL; fn=NULL; ndn=0; nfn=0;
+  dn = (DNode*)ps5_alloc_large(sizeof(DNode)*(total+16));
+  fn = (FNode*)ps5_alloc_large(sizeof(FNode)*(total+16));
+  if(!dn || !fn){ LOG("RomFS: index arrays alloc failed (nodes=%d)\n", total); return 0; }
+  /* Name arena: sized EXACTLY from the container, i.e. the sum of (name_len+1)
+     over every node, plus 8 bytes per node for the terminator/alignment pad and
+     a little slack.  Measured on the Bananza container: 5.28 MiB of names over
+     166,433 nodes.  The earlier "pool + 2 bytes/node" estimate asked for only
+     2.3 MiB and ran dry at ~43%, so names were silently truncated. */
+  u64 name_bytes = nup_name_bytes();
+  g_name_cap = name_bytes + (u64)total*8 + 4096;
+  g_name_overflow = 0;
+  LOG("RomFS: index %d nodes, names %llu bytes -> arena %.1f MB\n",
+      total, (unsigned long long)name_bytes, (double)g_name_cap/1048576.0);
+  g_name_arena = (char*)ps5_alloc_large(g_name_cap);
+  g_name_pos = 0;
+  if(!g_name_arena){ LOG("RomFS: name arena alloc failed\n"); return 0; }
+  add_dir("",0); dn[0].parent=0; g_romdir_len=0;
+  nup_scan(root,0);
+  LOG("RomFS: NUP scanned %d folders, %d files (names used %llu/%llu bytes)\n",
+      ndn, nfn, (unsigned long long)g_name_pos, (unsigned long long)g_name_cap);
+  finalize_romfs();
+  return nrfiles>0;
+}
+
+extern int g_nup_err;
+extern int g_nup_errno;
 
 void romfs_init(void){
   pm_init(&g_romlock);
+  LOG("RomFS: g_datadir=%s\n", g_datadir);
   char p[1200];
+  /* Direct NUP reader: the romfs lives inside the container, so we never expand
+     it to a flat folder or enumerate via a manifest (that path forced a
+     libc-heap-corrupting traversal of 75k files at startup). */
+  /* (1) explicit pointer file in the package: <datadir>/romfs_nup.txt
+     holds an absolute path to the NUP container (generic, works for any game).
+     Uses g_datadir (the real on-disk path, e.g. /mnt/usb1/PPSA99201/swr_data)
+     rather than /app0, which is not a usable fopen path under OrbisOS libc. */
+  {
+    char cfg[1400];
+    size_t dl = strlen(g_datadir);
+    while (dl>0 && g_datadir[dl-1]=='/') dl--;
+    snprintf(cfg,sizeof cfg,"%.*s/romfs_nup.txt",(int)dl,g_datadir);
+    FILE* cf=fopen(cfg,"rb");
+    if(cf){
+      char line[1400];
+      if(fgets(line,sizeof line,cf)){
+        size_t L=strlen(line);
+        while(L>0 && (line[L-1]=='\n'||line[L-1]=='\r'||line[L-1]==' '||line[L-1]=='\t')) line[--L]=0;
+        if(line[0] && plat_file_size(line)){
+          const char* src = line;
+          LOG("RomFS: pointer-file NUP %s\n", src);
+          if(nup_open(src) && romfs_build_nup()){
+            LOG("RomFS: loaded from NUP %s (%d folders, %d files, %.1f MB)\n", src, ndn, nfn, (double)rtotal/1048576.0);
+            fclose(cf); return;
+          }
+          nup_close();
+        }
+      }
+      fclose(cf);
+    }
+  }
+  /* (2) candidate NUP locations.
+     PREFER a package-local copy (g_datadir/romfs.nup == /app0/swr_data/romfs.nup):
+     under the PS5 app sandbox /app0 is the ONLY path the app can actually
+     read through open()+pread(); the USB games folder is only stat()-visible,
+     pread() returns garbage there (the sandbox blocks cross-package I/O). The
+     games folder stays as a compatibility location for other dumps. */
+  char pkgnup[1200];
+  size_t dl = strlen(g_datadir);
+  while(dl>0 && g_datadir[dl-1]=='/') dl--;
+  snprintf(pkgnup,sizeof pkgnup,"%.*s/romfs.nup",(int)dl,g_datadir);
+  const char* cand[] = {
+    pkgnup,
+    "/mnt/usb1/games/Donkey Kong BananzaUpdate3.2.0DLC.nup",
+    NULL };
+  for(int i=0; cand[i]; i++){
+    u64 z=plat_file_size(cand[i]);
+    g_nup_err=0;
+    const char* src = cand[i];
+    int ok=nup_open(src);
+    LOG("RomFS: probe[%d] %s size=%llu nup_open=%d nup_err=%d errno=%d\n", i, src, (unsigned long long)z, ok, g_nup_err, g_nup_errno);
+    if(z && ok && romfs_build_nup()){
+      LOG("RomFS: loaded from NUP %s (%d folders, %d files, %.1f MB)\n", src, ndn, nfn, (double)rtotal/1048576.0);
+      return;
+    }
+    nup_close();
+  }
   if(g_romfs_dir_override[0] && plat_is_dir(g_romfs_dir_override)){ LOG("RomFS: %s\n",g_romfs_dir_override); romfs_build(g_romfs_dir_override); return; }
   snprintf(p,sizeof p,"%sromfs.bin",g_datadir); rraw=fopen(p,"rb");
   if(rraw){ rtotal=plat_file_size(p); LOG("RomFS: image %s (%.1f MB)\n",p,(double)rtotal/1048576.0); return; }
   snprintf(p,sizeof p,"%sromfs",g_datadir);
-  if(plat_is_dir(p)){ romfs_build(p); return; }
+  int isdir=plat_is_dir(p);
+  if(isdir){ romfs_build(p); return; }
   LOG("RomFS: none (folder %s)\n",p);
   char q[1200]; snprintf(q,sizeof q,"%sexefs/main.nro",g_datadir);
   if(!plat_file_size(q)){
     char m[1600]; snprintf(m,sizeof m,"The game's romfs is missing (the data: models, textures, sound).\n\n"
-      "Extract it with hactool (--romfsdir=romfs) and copy the folder to:\n%s\n\nThe game will close when it tries to read its data.",p);
+      "Copy the NUP container to romfs.nup and retry.\n\nThe game will close when it tries to read its data.",p);
 #if defined(_WIN32)
     extern void win_fatal_box(const char*); win_fatal_box(m);
 #else
@@ -133,37 +344,74 @@ static FILE* rf_open(const char* path){
   if(openf[lru].f) fclose(openf[lru].f);
   openf[lru].f=fopen(path,"rb"); openf[lru].path=path; openf[lru].last=++openclk; return openf[lru].f; }
 
+/* ---- structured RomFS read tracing -------------------------------------
+   One console run shows every read, which file it landed in, and the first
+   bytes ACTUALLY returned.  The last part is decisive: nup_read_file() used to
+   silently memset() a failed zstd decompress to zero, so the log claimed a
+   HIT while the game received a buffer full of zeros and its BYML/RESTBL
+   parser failed (LoadResult = 7).  Rate-limited so gameplay stays cheap. */
+static u32 g_rr_trace_n, g_rr_hex_n;
+static void rr_trace(u64 off, u64 size, const char* what, const char* name, u64 delta){
+  u32 n=__atomic_fetch_add(&g_rr_trace_n,1,__ATOMIC_RELAXED);
+  if(n>=128 && (n&255)) return;
+  LOG("romfs: read off=%llu sz=%llu -> %-8s %s +%llu\n",
+      (unsigned long long)off,(unsigned long long)size,what,
+      name? name : "-",(unsigned long long)delta);
+}
+static void rr_hex(u64 off, const u8* p, u64 n, int node, const char* tag){
+  u32 k=__atomic_fetch_add(&g_rr_hex_n,1,__ATOMIC_RELAXED);
+  if(k>=48 && (k&63)) return;
+  char b[64]; int w=0;
+  for(int i=0;i<16 && (u64)i<n;i++) w+=snprintf(b+w,(size_t)(sizeof b-w),"%02x",p[i]);
+  b[w]=0;
+  LOG("romfs: data off=%llu node=%d %s -> %s\n",
+      (unsigned long long)off,node,tag,b);
+}
+
 int romfs_read(u64 off, void* dst, u64 size){
   u8* d=dst;
   if(rraw){ pm_lock(&g_romlock); int r=plat_pread(rraw,d,size,off); pm_unlock(&g_romlock); return r<0? -1 : 0; }
-  if(off<rmeta_size){ u64 n=rmeta_size-off; if(n>size) n=size; memcpy(d,rmeta+off,n); d+=n; off+=n; size-=n; }
+  if(off<rmeta_size){ u64 n=rmeta_size-off; if(n>size) n=size;
+    rr_trace(off,n,"META",0,0);
+    memcpy(d,rmeta+off,n); d+=n; off+=n; size-=n; }
   pm_lock(&g_romlock);
   while(size){
     int lo=0, hi=nrfiles-1, k=-1;
     while(lo<=hi){ int m=(lo+hi)/2; if(rfiles[m].off<=off){ k=m; lo=m+1; } else hi=m-1; }
-    if(k<0){ memset(d,0,size); break; }
+    if(k<0){ rr_trace(off,size,"NO-FILE",0,0); memset(d,0,size); break; }
     RFile* f=&rfiles[k];
     if(off>=f->off+f->size){ /* inter-file padding */
+      rr_trace(off,size,"PADDING",0,off-(f->off+f->size));
       u64 nx= k+1<nrfiles? rfiles[k+1].off : rtotal; u64 n=nx>off? nx-off : size; if(n>size) n=size; if(!n) n=size; memset(d,0,n); d+=n; off+=n; size-=n; continue; }
     u64 n=f->off+f->size-off; if(n>size) n=size;
-#ifdef SWR_HAVE_VP9
-    { extern void vp9_note_file(const char* path); vp9_note_file(f->path); }
-#endif
+    rr_trace(off,size,"HIT",f->path+g_romdir_len,off-f->off);
     if(!f->logged){ f->logged=1; LOG("romfs: %s (%.1f KB)\n",f->path+g_romdir_len,(double)f->size/1024.0); }
-    FILE* fp=rf_open(f->path);
-    if(!fp || plat_pread(fp,d,n,off-f->off)<(int)n){ memset(d,0,n); }
+    if(f->nup_node>=0){
+      int rr=nup_read_file(f->nup_node, off-f->off, d, n);
+      if(rr<0){ static u32 w;
+        u32 k2=__atomic_fetch_add(&w,1,__ATOMIC_RELAXED);
+        if(k2<16) LOG("romfs: READ-FAIL node=%d off=%llu n=%llu name=%s -> zero fill\n",
+                      f->nup_node,(unsigned long long)(off-f->off),(unsigned long long)n,f->path+g_romdir_len);
+        memset(d,0,n); }
+      rr_hex(off-f->off,d,n,f->nup_node,rr<0? "zeros":"read");
+    } else {
+      FILE* fp=rf_open(f->path);
+      if(!fp || plat_pread(fp,d,n,off-f->off)<(int)n){ memset(d,0,n); }
+      rr_hex(off-f->off,d,n,-1,"file");
+    }
     d+=n; off+=n; size-=n;
   }
   pm_unlock(&g_romlock);
   return 0;
 }
 
+
 /* ============================================================ IStorage (RomFS) */
 static int romstorage(SvcObj* o, IpcCtx* c){
   switch(c->cmd){
     case 0: { u64 off=in64(c,0), sz=in64(c,8), a, bs; buf_out(c,0,&a,&bs); if(sz>bs) sz=bs;
       if(off>rtotal) return RC(2,6001); if(off+sz>rtotal) sz=rtotal-off;
-      romfs_read(off,GP(a),sz); return 0; }
+      romfs_read(off,GP(a),sz); c->direct_out=1; return 0; }
     case 4: out64(c,rtotal); return 0;
     case 1: case 2: case 3: return RC(2,6300);
     case 5: { u8 z[0x40]; memset(z,0,sizeof z); outbytes(c,z,0x40); return 0; }

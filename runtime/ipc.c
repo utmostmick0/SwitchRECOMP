@@ -4,6 +4,14 @@
 /* HIPC/CMIF (+domains). requests get served on the calling thread, no server threads and no context switches */
 #include "rt.h"
 
+/* [S2] The real KHandle of the GSV TIPC session created by ISelfController
+   cmd 2000 (GetGraphicsSupervisor).  Bananza's nnSdk keeps handle 0 in its
+   GSV singleton even though the reply carries this handle in both the special
+   section and the domain object-id slot, then issues TIPC requests against 0.
+   Route those requests here instead of failing with 0xE401.  Zero until the
+   first cmd 2000, and only used for TIPC (type >= 16) messages. */
+u32 g_gsv_handle;
+
 /* ============================================================ service objects */
 SvcObj* svcobj_new(const char* name, int (*dispatch)(SvcObj*, IpcCtx*), size_t ds){
   SvcObj* o=calloc(1,sizeof *o); o->name=name; o->dispatch=dispatch; o->refs=1; if(ds) o->data=calloc(1,ds); return o; }
@@ -30,7 +38,19 @@ int ipc_warn_once(const char* name, u32 cmd){
   for(int i=0;i<nt;i++) if(t[i].cmd==cmd && !strcmp(t[i].n,name)) return ++t[i].cnt<=3;
   if(nt<512){ t[nt].n=name; t[nt].cmd=cmd; t[nt].cnt=1; nt++; } return 1; }
 
-int stub_ok(SvcObj* o, IpcCtx* c){ if(ipc_warn_once(o->name,c->cmd)) LOG("  [stub] %s cmd %u -> ok\n",o->name,c->cmd); return 0; }
+/* Human readable summary of a request we are about to answer with nothing: the raw
+   argument words plus how much output the caller asked for. Seeing the arguments is
+   what turns "some applet command returned empty" into an implementable spec, so this
+   is logged once per (service, cmd) and nowhere else. */
+void ipc_arg_str(IpcCtx* c, char* out, int cap){
+  int p=0; p+=snprintf(out+p,cap-p," args");
+  for(int i=0;i<6;i++){ u32 v=0; memcpy(&v,c->raw+i*4,4); p+=snprintf(out+p,cap-p," %x",v); if(p>=cap-16) break; }
+  u64 need=0; for(int i=0;i<c->nb && i<MAX_BUFS;i++) need+=c->b[i].size;
+  for(int i=0;i<c->nc && i<MAX_BUFS;i++) need+=c->c[i].size;
+  snprintf(out+p,cap-p," | wants %llu out bytes, %d copy-h, %d move-h",(unsigned long long)need,c->ncopy,c->nmove);
+}
+
+int stub_ok(SvcObj* o, IpcCtx* c){ if(ipc_warn_once(o->name,c->cmd)){ char a[128]; ipc_arg_str(c,a,sizeof a); LOG("  [stub] %s cmd %u -> ok%s\n",o->name,c->cmd,a); } return 0; }
 
 /* ============================================================ registry */
 typedef struct { char name[16]; SvcCtor ctor; } SvcReg;
@@ -59,11 +79,20 @@ int buf_in(IpcCtx* c, int i, u64* a, u64* s){
   *a=0; *s=0; return 0; }
 
 int buf_out(IpcCtx* c, int i, u64* a, u64* s){
-  if(i<c->nb && c->b[i].addr && c->b[i].size) return buf_b(c,i,a,s);
-  if(i<c->nc && c->c[i].addr) return buf_cs(c,i,a,s);
-  if(c->nc==1 && i>0 && c->c[0].addr){ *a=0; *s=0; return 0; }
-  if(i<c->nb) return buf_b(c,i,a,s);
-  *a=0; *s=0; return 0; }
+  /* Handlers memcpy() straight into GP(a) instead of using the out*() reply
+     helpers.  Record that as produced output here, once, instead of making
+     every one of ~20 dispatch branches remember to set c->direct_out.  This
+     is what removes the census false positives ("IStorageAccessor cmd 11
+     returned OK but wrote NO output") while still flagging stub_ok defaults,
+     which never call buf_out() at all. */
+  int r=0;
+  if(i<c->nb && c->b[i].addr && c->b[i].size) r=buf_b(c,i,a,s);
+  else if(i<c->nc && c->c[i].addr) r=buf_cs(c,i,a,s);
+  else if(c->nc==1 && i>0 && c->c[0].addr){ *a=0; *s=0; return 0; }
+  else if(i<c->nb) r=buf_b(c,i,a,s);
+  else { *a=0; *s=0; return 0; }
+  if(r && *a && *s) c->direct_out=1;
+  return r; }
 
 void buf_x_out(IpcCtx* c, int i, u64 a, u64 s){ if(c->nx_out<MAX_BUFS){ c->x_out_addr[c->nx_out]=a; c->x_out_size[c->nx_out]=s; c->nx_out++; } (void)i; }
 
@@ -125,6 +154,13 @@ static void parse(IpcCtx* c){
 static void respond(IpcCtx* c){
   u8* m=c->msg; memset(m,0,0x100);
   int dom= c->is_domain!=0 && !c->tipc;
+  /* [S2] ISelfController cmd 2000 (GetGraphicsSupervisor) is issued as a
+     CMIF domain request (type 6, domain=2), but nnSdk consumes the result as
+     a real TIPC KHandle and immediately calls svcSendSyncRequest on it.
+     Mirror the move handle into the domain object-id slot as well, so either
+     reply interpretation yields the very same valid KHandle. */
+  int gsv_dom= dom && c->cmd==2000 && c->nout_move>0;
+  u32 ndom_objs= gsv_dom? 1u : (u32)c->nout_objs;
   u32 nhandles=c->nout_copy+c->nout_move;
   if(!dom) nhandles+=c->nout_objs;           /* out objects become new session handles */
   u32 w0=0; w0|=(u32)(c->nx_out&15)<<16;
@@ -134,7 +170,7 @@ static void respond(IpcCtx* c){
   u32 pad_bytes=((hdr_words*4+15)&~15)-hdr_words*4;
   /* SFCO(16) + payload; domains add a 16 byte header and object ids */
   u32 payload=(c->out_size+3)&~3u;
-  u32 data_bytes=16+payload+(dom? 16+c->nout_objs*4 : 0);
+  u32 data_bytes=16+payload+(dom? 16+ndom_objs*4 : 0);
   u32 ndata=(pad_bytes+data_bytes+3)/4+ (16/4);   /* same slack the real kernel leaves */
   memcpy(m,&w0,4);
   u32 w1=ndata|(special? 0x80000000u : 0); memcpy(m+4,&w1,4);
@@ -153,13 +189,14 @@ static void respond(IpcCtx* c){
     memcpy(p,&c->rc,4); memcpy(p+4,c->out,payload); return; }
   u8* d=m+(((p-m)+15)&~15);
   if(dom){
-    u32 n=c->nout_objs; memcpy(d,&n,4); d+=16;
+    memcpy(d,&ndom_objs,4); d+=16;
   }
   u32 magic=0x4F434653; memcpy(d,&magic,4); u32 ver=0; memcpy(d+4,&ver,4); memcpy(d+8,&c->rc,4); memcpy(d+12,&c->token,4);
   memcpy(d+16,c->out,payload);
   if(dom){
     u8* o=d+16+payload;
-    for(int i=0;i<c->nout_objs;i++){
+    if(gsv_dom){ memcpy(o,&c->out_move[0],4); }
+    else for(int i=0;i<c->nout_objs;i++){
       u32 id=domain_add(c->sess->domain,c->out_objs[i]);
       memcpy(o+i*4,&id,4); }
   }
@@ -176,13 +213,59 @@ SvcObj* ipc_in_obj(IpcCtx* c, int i){
   KSession* s=(KSession*)h_get_type(c->move_h[i],KO_SESSION); if(!s || !s->obj) return NULL;
   __atomic_add_fetch(&s->obj->refs,1,__ATOMIC_SEQ_CST); return s->obj; }
 
+/* ============================================================ census
+   Every (service, cmd) pair the game asks for, with how often it came back
+   without producing ANY output at all. That second column is the useful one:
+   a command that takes output buffers and writes nothing leaves the game
+   holding a NULL interface/object, and nnSdk then calls through the null
+   pointer thousands of instructions later (nn::am / nn::oe do exactly this).
+   The table is dumped from the svcBreak path, so one console run shows the
+   whole remaining service surface instead of the first thing that broke. */
+typedef struct { const char* name; u32 cmd, n, empty; } IpcStat;
+static IpcStat g_ist[1024]; static int g_nist;
+
+static IpcStat* ist_get(const char* name, u32 cmd){
+  for(int i=0;i<g_nist;i++) if(g_ist[i].cmd==cmd && g_ist[i].name==name) return &g_ist[i];
+  if(g_nist>=1024) return NULL;
+  IpcStat* s=&g_ist[g_nist++]; s->name=name; s->cmd=cmd; s->n=0; s->empty=0; return s; }
+
+void ipc_dump_stats(void){
+  if(!g_nist){ LOG("ipc: no commands recorded\n"); return; }
+  u64 total=0; for(int i=0;i<g_nist;i++) total+=g_ist[i].n;
+  LOG("ipc: %d distinct (service, cmd) pairs, %llu requests\n",g_nist,(unsigned long long)total);
+  for(int i=0;i<g_nist;i++)
+    LOG("  %-30s cmd %-4u x%-8u%s\n",g_ist[i].name,g_ist[i].cmd,g_ist[i].n,
+        g_ist[i].empty? "  <== NEVER WROTE OUTPUT" : "");
+}
+
 void ipc_handle(KThread* t, u32 handle, u64 msg_addr){
   CPU* cpu=&t->cpu;
   KSession* s=(KSession*)h_get_type(handle,KO_SESSION);
-  if(!s){ WARN("SendSyncRequest to invalid handle %x (pc=%llx)\n",handle,(unsigned long long)cpu->pc); cpu->x[0]=0xE401; return; }
+  /* [S2] nnSdk's GSV singleton retains handle 0 even though GetGraphicsSupervisor
+     returned a valid KHandle.  Its BootWithRemoteMemory / SetCurrentProcessHandle /
+     CreateContext requests are TIPC (type = 16 + cmd), so they are unambiguous:
+     route handle-0 TIPC traffic to the session we created.  No other service uses
+     handle 0 for TIPC, so this cannot mask a genuine invalid-handle bug. */
+  if(!s && !handle && g_gsv_handle){
+    u32 w0=0; memcpy(&w0,GP(msg_addr),4);
+    if((w0&0xFFFF)>=16){
+      KSession* gs=(KSession*)h_get_type(g_gsv_handle,KO_SESSION);
+      if(gs){ handle=g_gsv_handle; s=gs;
+        if(ipc_warn_once("gsv:handle0",w0&0xFFFF))
+          LOG("ipc: TIPC type %u on handle 0 -> GSV handle %x\n",(unsigned)(w0&0xFFFF),g_gsv_handle); }
+    }
+  }
+  if(!s){ WARN("SendSyncRequest to invalid handle %x (pc=%llx)\n",handle,(unsigned long long)cpu->pc);
+    { u32 q[4]; memcpy(q,GP(msg_addr),16);
+      LOG("ipc: bad-handle msg hdr %08x %08x %08x %08x (addr=%llx)\n",
+          q[0],q[1],q[2],q[3],(unsigned long long)msg_addr); }
+    cpu->x[0]=0xE401; return; }
   IpcCtx* c=calloc(1,sizeof *c);
   c->th=t; c->msg=GP(msg_addr); c->msg_addr=msg_addr; c->sess=s;
   parse(c);
+  if(c->cmd==2000){ u32 q[8]; memcpy(q,c->msg,32);
+    LOG("ipc: cmd2000 request hdr %08x %08x %08x %08x %08x %08x %08x %08x (type=%u tipc=%d dom=%d)\n",
+        q[0],q[1],q[2],q[3],q[4],q[5],q[6],q[7],c->type,c->tipc,c->is_domain); }
   cpu->x[0]=0;
   if(c->type==2 || c->type==15){ /* client closes the handle itself afterwards */ free(c); return; }
   if(c->type==5 || c->type==7){ /* control */
@@ -209,7 +292,21 @@ void ipc_handle(KThread* t, u32 handle, u64 msg_addr){
   LOGV("IPC %s cmd %u\n",obj->name,c->cmd);
   c->rc=(u32)obj->dispatch(obj,c);
   { u32 i=__atomic_fetch_add(&g_ipc_ring_n,1,__ATOMIC_RELAXED)&31; u32 in0=0,in1=0; memcpy(&in0,c->raw,4); memcpy(&in1,c->raw+4,4); snprintf(g_ipc_ring[i],80,"%s cmd %u (in %x %x) -> %x",obj->name,c->cmd,in0,in1,c->rc); }
+  { IpcStat* st=ist_get(obj->name,c->cmd);
+    if(st){ st->n++;
+      /* RomFS/IStorage handlers memcpy straight into the guest out buffer via
+         GP(a) instead of going through out*() helpers; count that as output
+         too, otherwise the census flags every successful read as "empty". */
+      int produced = c->nout_copy + c->nout_move + c->nout_objs + c->nx_out
+                     + (c->out_size?1:0) + c->direct_out;
+      if(!produced && !c->rc && (c->nb || c->nc)){ st->empty++;
+        if(st->empty<=3) WARN("ipc: %s cmd %u returned OK but wrote NO output (%d out bufs)\n",obj->name,c->cmd,c->nb+c->nc); } } }
   respond(c);
+  if(c->cmd==2000){
+    u32 q[8]; memcpy(q,c->msg,32);
+    LOG("ipc: cmd2000 reply hdr %08x %08x %08x %08x %08x %08x %08x %08x (move=%d obj=%d tipc=%d dom=%d)\n",
+        q[0],q[1],q[2],q[3],q[4],q[5],q[6],q[7],
+        c->nout_move,c->nout_objs,c->tipc,c->is_domain); }
   if(c->is_domain) svcobj_unref(obj);           /* drop the ref from domain_get */
   free(c);
 }

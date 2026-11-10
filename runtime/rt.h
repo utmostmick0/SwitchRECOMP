@@ -88,6 +88,7 @@ extern __thread void* tls_thread;
 
 /* ======================================================= log */
 extern int g_verbose;
+extern int g_log_fsync;   /* fsync each log line (startup only; see plat.c) */
 void logf_(int lvl, const char* fmt, ...);
 #define LOG(...)  logf_(1,__VA_ARGS__)
 #define LOGV(...) do{ if(g_verbose>=2) logf_(2,__VA_ARGS__); }while(0)
@@ -133,6 +134,13 @@ u64  mem_find_free(u64 lo, u64 hi, u64 size, u64 align);
 u64  kmem_alloc(u64 size, u32 state, u32 perm);                   /* reserved for the kernel */
 u64  mem_heap_set(u64 size);
 extern u64 g_heap_size, g_heap_max;
+#ifdef SWR_PS5
+/* PS5 page-table budget + shared zero page (see plat.c, mem.c) */
+void plat_ps5_pt_stats(u32* used, u32* limit, u32* watermark);
+int  mem_reclaim_pt(u32 target_watermark);
+int  mem_zero_page_init(void);
+u8*  mem_zero_page(void);
+#endif
 #define GP(a) (g_mem+(u64)(a))
 static inline u32 gr32(u64 a){ u32 v; memcpy(&v,GP(a),4); return v; }
 
@@ -199,6 +207,7 @@ void   kthread_start(KThread* t);
 void   kernel_run_main(u64 entry, u64 stack_size, int prio, int core);
 void   swr_svc(CPU* c, u32 imm);
 extern PMutex g_klock;
+extern u32 g_gsv_handle;      /* [S2] GSV TIPC session handle (see ipc.c) */
 extern u64 g_title_id;
 extern int g_exiting;
 void   process_exit(int code);
@@ -223,6 +232,7 @@ typedef struct IpcCtx {
   u32 out_copy[8], out_move[8]; int nout_copy, nout_move;
   struct SvcObj* out_objs[8]; int nout_objs;
   u64 x_out_addr[MAX_BUFS], x_out_size[MAX_BUFS]; int nx_out;
+  int direct_out;   /* handler wrote straight into an out buffer via GP(a) */
   struct KSession* sess;
 } IpcCtx;
 
@@ -248,6 +258,7 @@ SvcObj* svcobj_new(const char* name, int (*dispatch)(SvcObj*, IpcCtx*), size_t d
 void    svcobj_unref(SvcObj* o);
 u32     session_new(SvcObj* obj);
 void    ipc_handle(KThread* t, u32 handle, u64 msg_addr);
+void    ipc_dump_stats(void);   /* every (service, cmd) the game asked for */
 /* reading args */
 static inline u32 in32(IpcCtx* c, u32 off){ u32 v=0; if(off+4<=c->raw_size) memcpy(&v,c->raw+off,4); return v; }
 
@@ -280,6 +291,9 @@ int  buf_cs(IpcCtx* c, int idx, u64* addr, u64* size);
 #define RC(mod,desc) ((mod)|((desc)<<9))
 #define RC_OK 0
 int stub_ok(SvcObj* o, IpcCtx* c);
+/* "service cmd N ... args .. | wants X out bytes" text for the commands we answer
+   with nothing; logged once per (service, cmd) so one run documents the whole gap. */
+void ipc_arg_str(IpcCtx* c, char* out, int cap);
 SvcObj* svc_generic(const char* name);               /* empty success reply, logged */
 
 /* service registry */

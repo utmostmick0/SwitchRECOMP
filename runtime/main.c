@@ -13,6 +13,7 @@ const char* g_runtime_version=SWR_RUNTIME_VERSION;
 #include "rt.h"
 #include "audio.h"
 #include <sys/stat.h>
+#include <errno.h>
 static int g_opt_null_trap;   /* null_trap= in the ini */
 
 const SwrModule* g_mod;
@@ -44,6 +45,65 @@ void save_hints(void){
 static void load_hints(void){ FILE* f=fopen(g_hints_path,"r"); if(!f) return; char ln[64]; while(fgets(ln,sizeof ln,f)){ u64 v=strtoull(ln,NULL,16); if(v){ if(g_nhints==g_caphints){ g_caphints=g_caphints?g_caphints*2:256; g_hints=realloc(g_hints,8*g_caphints);} g_hints[g_nhints++]=v; } } fclose(f); }
 
 void kernel_dump_regs(CPU* c);
+
+#ifdef SWR_PS5
+/* ---- out-of-range indirect guest calls -----------------------------------
+   A NULL guest function pointer (unresolved weak import, an SDK singleton
+   that was never initialised) used to land in the interpreter at guest pc=0,
+   which raised "Unsupported instruction 00000000 at 0" and killed the title
+   at the first missing path.  swr_lookup() is inlined into every generated
+   object, but it returns the *global* swr_interp_entry, so wrapping that one
+   pointer needs only a runtime rebuild, not a full 281-object regeneration.
+
+   In-range targets still go to the real interpreter (dynamic code, basic
+   blocks that were never recompiled).  Out-of-range targets are collected in
+   one table, logged once per distinct (target,caller), and faked as a call
+   that returns 0: one console tap now exposes every missing path instead of
+   stopping at the first one.  Every crash report dumps the whole table. */
+typedef struct { u64 target, caller, count; } BadCall;
+#define SWR_BAD_MAX 256
+static BadCall g_bad[SWR_BAD_MAX];
+static int g_nbad;
+static GuestFn g_real_interp;
+
+void swr_dump_bad_calls(void){
+  if(!g_nbad){ LOG("badcall: none\n"); return; }
+  WARN("badcall: %d distinct out-of-range indirect targets\n",g_nbad);
+  for(int i=0;i<g_nbad;i++)
+    WARN("  badcall[%d] target=%llx caller=%llx count=%llu\n",i,
+         (unsigned long long)g_bad[i].target,(unsigned long long)g_bad[i].caller,
+         (unsigned long long)g_bad[i].count);
+}
+
+static void interp_guard(CPU* c, u64 pc){
+  if(pc>=g_code_lo && pc<g_code_hi){ g_real_interp(c,pc); return; }
+  u64 lr=c->x[30];
+  int i; for(i=0;i<g_nbad;i++) if(g_bad[i].target==pc && g_bad[i].caller==lr) break;
+  if(i==g_nbad){
+    if(g_nbad<SWR_BAD_MAX){ g_bad[g_nbad]=(BadCall){pc,lr,0}; i=g_nbad++; }
+    else i=SWR_BAD_MAX-1;                 /* keep counting in the last slot */
+  }
+  u64 n=++g_bad[i].count;
+  if(n==1 || n==1000)
+    WARN("badcall: target=%llx caller=%llx count=%llu x0=%llx x1=%llx x2=%llx x8=%llx -> fake return 0\n",
+         (unsigned long long)pc,(unsigned long long)lr,(unsigned long long)n,
+         (unsigned long long)c->x[0],(unsigned long long)c->x[1],
+         (unsigned long long)c->x[2],(unsigned long long)c->x[8]);
+  /* In Switch 2 nn::oe graphics scale / performance mode query (0xa966700 ->
+     0xa9667ec), x1 points to an output u32 on the stack that must be 10, 20,
+     or 30 (otherwise 0xa966724 calls nn::detail::UnexpectedDefaultImpl ->
+     svcBreak, run 1943).  Populate *x1 = 20 (Docked) / 10 (Handheld). */
+  if(lr>=0xa966600ull && lr<0xa966900ull && c->x[1]>=AS_BASE && c->x[1]+4<=AS_SIZE){
+    MemBlock b; mem_query(c->x[1],&b);
+    if(b.state!=MS_FREE && b.state!=MS_INACCESSIBLE && (b.perm&PERM_W)){
+      extern int g_opt_docked;
+      u32 mode = g_opt_docked ? 20u : 10u;
+      memcpy(GP(c->x[1]),&mode,4);
+    }
+  }
+  c->x[0]=0; c->pc=lr;                 /* resume after the failing BLR/BR */
+}
+#endif
 
 static void rt_undef(CPU* c, u64 pc, u32 w){
   WARN("\nUnsupported instruction %08x at %llx\n",w,(unsigned long long)pc); c->pc=pc; kernel_dump_regs(c);
@@ -128,7 +188,33 @@ const RtAPI g_rtapi={swr_svc,rt_undef,rt_note_hint,rt_ticks,rt_brk,rt_fpcr,rt_se
 void crash_report(void* host_pc, void* fault, int sig){
   KThread* t=kthread_cur();
   u64 ga=(u64)((u8*)fault-g_mem);
+  /* Mirror the crash signature to the independent fsync-backed diag file so it
+     survives even if the buffered log is lost. */
+  { extern void romfs_diag(const char*); char b[128];
+    snprintf(b,sizeof b,"CRASH sig=%d host_pc=%p fault=%p ga=%llx\n",sig,host_pc,fault,(unsigned long long)ga); romfs_diag(b); }
+  { extern char g_diag_manopen_dir[]; char b[2048];
+    snprintf(b,sizeof b,"LAST_MANOPEN=%s\n",g_diag_manopen_dir); romfs_diag(b); }
   logf_(0,"\n*** Crash (signal %d) at host pc=%p, access to %p (game address %llx) ***\n",sig,host_pc,fault,(unsigned long long)ga);
+#ifdef SWR_PS5
+  swr_dump_bad_calls();
+#endif
+  /* Dump the full service/import surface BEFORE the register+code dump: one
+     crash now exposes every still-empty IPC command and unresolved GOT slot,
+     instead of only the single branch that happened to fault. */
+  { extern void kernel_crash_census(void); kernel_crash_census(); }
+  /* PIE diagnostics: print an offset relative to a symbol whose ELF address is
+     known from nm. Locally, pc_off = (pc_rel + nm(crash_report)) maps straight
+     into llvm-addr2line, whatever ASLR base the console picked. */
+  { u64 p=(u64)(size_t)host_pc, self=(u64)(size_t)&crash_report;
+    u64 rel = p>=self? p-self : self-p;
+    logf_(0,"  diag: &crash_report=%p pc_rel=%s%llx g_mod=%p g_disp=%p g_mem=%p\n",
+          (void*)self, (p>=self? "+" : "-"), (unsigned long long)rel,
+          (void*)g_mod, (void*)g_disp, (void*)g_mem);
+    /* The app ELF is ~236 MB. A bigger relative offset means the fault is
+       inside a system library (libc/libkernel), so addr2line on our ELF is
+       meaningless -- the stage/loader logs are what pin the call site. */
+    if(p>=self && rel>0x10000000ull)
+      logf_(0,"  diag: pc outside app image: fault inside a system library\n"); }
   { extern void mem_report(char*,int); char mr[200]; mem_report(mr,sizeof mr); logf_(0,"  memory: %s\n",mr);
 #ifdef _WIN32
     { extern char __ImageBase; u64 b=(u64)(size_t)&__ImageBase, p=(u64)(size_t)host_pc; if(p>=b && p<b+0x10000000ull) logf_(0,"  in the runtime itself (exe offset +%llx), thread %s\n",(unsigned long long)(p-b), kthread_cur()? "of the game" : "of the runtime (GPU, audio or window)"); }
@@ -369,7 +455,10 @@ const SwrModule* swr_module_static(void) __attribute__((weak));
 int g_code_tcc;
 
 static int load_code(void){
-  if(swr_module_static){ g_mod=swr_module_static(); return g_mod? 0 : -1; }
+  if(swr_module_static){
+    g_mod=swr_module_static();
+    LOG("code: statically linked module (swr_module_static, no dlopen)\n");
+    return g_mod? 0 : -1; }
   char p[1200];
 #if defined(_WIN32)
   snprintf(p,sizeof p,"%s%s_code.dll",g_exedir,g_exename);
@@ -378,7 +467,7 @@ static int load_code(void){
 #endif
   void* h=plat_dl_open(p);
   if(!h){
-#if !defined(_WIN32)
+#if !defined(_WIN32) && !defined(SWR_PS5)
     extern char* dlerror(void); WARN("dlopen: %s\n",dlerror());
 #endif
     WARN("Cannot find the recompiled code: %s\n",p); return -1; }
@@ -395,9 +484,36 @@ static int load_code(void){
 static void build_dispatch(void){
   g_code_lo=g_mod->code_lo; g_code_hi=g_mod->code_hi;
   u64 n=(g_code_hi-g_code_lo)/4;
+  LOG("dispatch: code=%llx..%llx slots=%llu (%.1f MiB) nentries=%u entry_addr=%p entry_fn=%p interp=%p\n",
+      (unsigned long long)g_code_lo,(unsigned long long)g_code_hi,(unsigned long long)n,
+      (double)(n*sizeof(GuestFn))/1048576.0,g_mod->nentries,
+      (void*)(size_t)g_mod->entry_addr,(void*)(size_t)g_mod->entry_fn,
+      (void*)(size_t)g_mod->interp);
+  u64 bytes=n? n*sizeof(GuestFn) : sizeof(GuestFn);
+#ifdef SWR_PS5
+  /* OrbisOS libc heap is tiny: calloc(87.8 MiB) fails with ENOMEM (measured).
+     ps5_alloc_large uses anonymous mmap and falls back to direct memory. */
+  extern void* ps5_alloc_large(u64 size);
+  g_disp=(GuestFn*)ps5_alloc_large(bytes);
+  LOG("dispatch: ps5_alloc_large -> %p %s\n",(void*)g_disp,g_disp?"OK":"FAILED");
+#else
   g_disp=calloc(n?n:1,sizeof(GuestFn));
-  for(u32 i=0;i<g_mod->nentries;i++){ u64 a=g_mod->entry_addr[i]; if(a>=g_code_lo && a<g_code_hi) g_disp[(a-g_code_lo)/4]=g_mod->entry_fn[i]; }
+  LOG("dispatch: calloc -> %p errno=%d\n",(void*)g_disp,errno);
+#endif
+  if(!g_disp) fatal("Could not allocate the dispatch table (%llu slots / %.1f MiB).",
+                    (unsigned long long)n,(double)(n*sizeof(GuestFn))/1048576.0);
+  u64 filled=0;
+  for(u32 i=0;i<g_mod->nentries;i++){ u64 a=g_mod->entry_addr[i];
+    if(a>=g_code_lo && a<g_code_hi){ g_disp[(a-g_code_lo)/4]=g_mod->entry_fn[i]; ++filled; } }
+#ifdef SWR_PS5
+  g_real_interp=g_mod->interp;
+  swr_interp_entry=interp_guard;
+  LOG("dispatch: interp_guard installed, real interp=%p\n",(void*)(size_t)g_real_interp);
+#else
   swr_interp_entry=g_mod->interp;
+#endif
+  LOG("dispatch: filled %llu/%u entries, interp_entry=%p\n",
+      (unsigned long long)filled,g_mod->nentries,(void*)(size_t)swr_interp_entry);
 }
 
 void services_init(void){
@@ -414,36 +530,68 @@ static void split_path(const char* argv0){
 }
 
 int swr_main(int argc, char** argv){
+#ifdef SWR_PS5
+  /* Native title layout (stage 1): /app0 is the read-only app mount and /data is
+     writable. argv[0] from the OrbisOS loader is not a usable filesystem path,
+     so pin both roots instead of deriving them from it. Game assets live in
+     /app0/swr_data/ (see tools/ps5/ps5build.py stage_package); ini, hints, the
+     crash log and threads.txt go to /data/switchrecomp/. */
+  strncpy(g_exedir,"/data/switchrecomp/",sizeof g_exedir-1); g_exedir[sizeof g_exedir-1]=0;
+  strncpy(g_exename,"swr",sizeof g_exename-1); g_exename[sizeof g_exename-1]=0;
+  plat_mkdir("/data/switchrecomp");
+#else
   split_path(argv[0]);
+#endif
   char ini[1400];
   snprintf(ini,sizeof ini,"%s%s.ini",g_exedir,g_exename); ini_open(ini);
   for(int i=1;i<argc;i++){ if(!strcmp(argv[i],"-v")) g_verbose=2; else if(!strncmp(argv[i],"--",2) && strchr(argv[i],'=')){ char k[256]; snprintf(k,sizeof k,"%s",argv[i]+2); char* e=strchr(k,'='); if(!e) continue; *e=0; backend_ini(k,e+1); if(!strcmp(k,"docked")) g_opt_docked=atoi(e+1); if(!strcmp(k,"fps_limit")){ g_opt_fps=atoi(e+1); if(g_opt_fps!=30 && g_opt_fps<60 && g_opt_fps!=0) g_opt_fps=60; } } }
+#ifdef SWR_PS5
+  snprintf(g_datadir,sizeof g_datadir,"/app0/swr_data/");
+#else
   snprintf(g_datadir,sizeof g_datadir,"%s%s_data/",g_exedir,g_exename);
+#endif
   snprintf(g_hints_path,sizeof g_hints_path,"%s%s.hints",g_exedir,g_exename);
   pm_init(&g_hint_lock); pm_init(&g_flock);
   plat_install_crash_handler();
   g_t0=plat_ns();
   LOG("SwitchRecomp - %s (runtime %s, built %s)\n",g_exename,SWR_RUNTIME_VERSION,__DATE__);
+  LOG("stage: load_code\n");
   if(load_code()) fatal("Could not load the game's recompiled code.");
   if(g_mod->abi!=1) fatal("The recompiled code is from another SwitchRecomp version.");
   g_title_id=g_mod->title_id;
+  LOG("stage: npdm_mmu_flags (datadir=%s)\n",g_datadir);
   { /* npdm MMU flags: bits 1-3 = address space type, 1 = the old 36-bit one */
     char q[1200]; snprintf(q,sizeof q,"%sexefs/main.npdm",g_datadir); FILE* f=fopen(q,"rb");
     if(f){ u8 h[0x10]; if(fread(h,1,0x10,f)==0x10 && !memcmp(h,"META",4) && ((h[0x0C]>>1)&7)==1){ mem_layout_36bit(); LOG("npdm: 36-bit address space (stack and TLS kept below 64 GB)\n"); } fclose(f); } }
+  LOG("stage: mem_init\n");
   mem_init(); if(g_opt_null_trap){ plat_vm_readonly(g_mem,0x10000); LOG("null_trap: writes to page 0 crash with a log\n"); }
-  kernel_init(); build_dispatch();
-  if(g_mod->init) g_mod->init(&g_rtapi);
-  load_hints();
+  LOG("stage: kernel_init\n"); kernel_init();
+  LOG("stage: build_dispatch\n"); build_dispatch();
+  LOG("stage: mod_init\n"); if(g_mod->init) g_mod->init(&g_rtapi);
+  LOG("stage: load_hints\n"); load_hints();
+  LOG("stage: loader_load\n");
   if(loader_load()) fatal("Could not load the game executables from %sexefs/",g_datadir);
+  LOG("stage: npdm_sysres\n");
   { /* npdm SystemResourceSize; newer SDKs only init their VM allocator when > 0 */
     extern u64 g_sysres_size; char q[1200]; snprintf(q,sizeof q,"%sexefs/main.npdm",g_datadir); FILE* f=fopen(q,"rb");
     if(f){ u8 h[0x20]; if(fread(h,1,0x20,f)==0x20 && !memcmp(h,"META",4)){ u32 v; memcpy(&v,h+0x14,4); g_sysres_size=v; } fclose(f); }
     LOG("npdm: system resource %.1f MB\n",g_sysres_size/1048576.0); }
-  services_init(); romfs_init(); gpu_init(); { extern void snxvk_gpu_init(void); snxvk_gpu_init(); }
-  { extern void hle_install(void); hle_install(); }
-  video_init(g_mod->title? g_mod->title : g_exename);
+  LOG("stage: services_init\n"); services_init();
+  LOG("stage: romfs_init\n"); romfs_init();
+  LOG("stage: gpu_init\n"); gpu_init();
+  LOG("stage: snxvk_gpu_init\n"); { extern void snxvk_gpu_init(void); snxvk_gpu_init(); }
+  LOG("stage: hle_install\n"); { extern void hle_install(void); hle_install(); }
+  /* [S2] replace the GPU driver's boot chain at the SDK-function level.
+     Must run after loader_load() (guest .dynsym) and after hle_install() so
+     nothing overwrites our dispatch slots afterwards. */
+  LOG("stage: s2_hle_hooks\n"); { extern void swr_install_s2_hooks(void); swr_install_s2_hooks(); }
+  LOG("stage: video_init\n"); video_init(g_mod->title? g_mod->title : g_exename);
   { extern void plat_prof_start(int); if(g_opt_prof){ plat_prof_start(0); LOG("profile: active (profile.txt every 10 s)\n"); } }
+  LOG("stage: kernel_run_main\n");
   kernel_run_main(g_mod->mods[0].base+g_mod->mods[0].text_off,g_mod->main_stack?g_mod->main_stack:0x100000,(int)g_mod->main_prio,(int)g_mod->main_core);
+  /* startup is done: stop fsync'ing every log line (it would stall gameplay once
+     the guest starts hammering the romfs "romfs: <file>" tracer). */
+  g_log_fsync = 0;
   /* 60Hz frontend loop */
   u64 next=plat_ns(); int tick=0;
   while(!g_quit){
@@ -458,6 +606,11 @@ int swr_main(int argc, char** argv){
     { static int lf=-1, still; if(g_vt_on && !g_rec_active){ if(g_frames!=lf){ lf=g_frames; still=0; } else if(++still==180){ vt_set(0); WARN("smooth recording: the game stopped presenting images; back to the normal clock\n"); } } else { lf=-1; still=0; } }
     frontend_frame();
     if(++tick%300==0) save_hints();
+    /* One-shot service census 12 s in. Together with the dump inside the svcBreak
+       path this covers both outcomes: the game panics (early dump) or it hangs /
+       runs without ever reaching the crash handler (this dump). Either way one
+       console run leaves behind the full list of services the title asked for. */
+    { static int censused; if(!censused && tick>=60*12){ censused=1; ipc_dump_stats(); } }
     { extern void snxvk_tick(int); snxvk_tick(tick); }   /* vulkan_native saves its pipeline cache now and then */
     /* dump thread states to threads.txt every 15s, useful when something hangs */
     if(tick%900==0){ extern __thread FILE* g_log_redirect; extern void kernel_dump_threads(void); char p[1200]; snprintf(p,sizeof p,"%sthreads.txt",g_exedir);
@@ -481,7 +634,10 @@ int swr_main(int argc, char** argv){
   _exit(0);
 }
 
-#if !defined(_WIN32)
+#if defined(SWR_PS5)
+/* OrbisOS has no dladdr(): crash reports show addresses without symbol names. */
+int dladdr_name(void* pc, char* out, int n){ (void)pc; if(n>0) out[0]=0; return 0; }
+#elif !defined(_WIN32)
 #include <dlfcn.h>
 
 int dladdr_name(void* pc, char* out, int n){ Dl_info i; if(dladdr(pc,&i) && i.dli_sname){ snprintf(out,n,"%s+%lx",i.dli_sname,(unsigned long)((u8*)pc-(u8*)i.dli_saddr)); return 1; } return 0; }

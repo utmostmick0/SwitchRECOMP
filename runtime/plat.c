@@ -14,6 +14,12 @@ static PMutex g_logm; static int g_logm_ok;
 
 __thread FILE* g_log_redirect;   /* redirect for the threads.txt dumps so they don't end up in the log, it's per
                                     thread so the other threads keep logging like normal */
+
+/* fsync every log line while the runtime is still starting up, so a hard
+   freeze/panic can't lose the trace (the PS5 leaves UFS2 page-cache data
+   unflushed). Cleared once the guest is running, because fsync per line would
+   otherwise stall gameplay (see docs/ps5_splash_hang_analysis.md, root cause 6). */
+int g_log_fsync = 1;
 void logf_(int lvl, const char* fmt, ...){
   if(!g_logm_ok){ pm_init(&g_logm); g_logm_ok=1; }
   char buf[2048]; va_list ap; va_start(ap,fmt); vsnprintf(buf,sizeof buf,fmt,ap); va_end(ap);
@@ -22,7 +28,14 @@ void logf_(int lvl, const char* fmt, ...){
   char tb[24]; snprintf(tb,sizeof tb,"[%7.2f] ",(double)(now-t0)/1e9);
   pm_lock(&g_logm);
   if(!g_logf){ char p[1200]; snprintf(p,sizeof p,"%s%s.log",g_exedir,g_exename[0]?g_exename:"switchrecomp"); g_logf=fopen(p,"w"); }
-  if(g_logf){ static int bol=1; if(bol) fputs(tb,g_logf); fputs(buf,g_logf); size_t L=strlen(buf); bol= L && buf[L-1]=='\n'; fflush(g_logf); }
+  if(g_logf){ static int bol=1; if(bol) fputs(tb,g_logf); fputs(buf,g_logf); size_t L=strlen(buf); bol= L && buf[L-1]=='\n'; fflush(g_logf);
+#if defined(__PROSPERO__) || defined(__ORBIS__)
+    /* On the PS5 a hard freeze/panic can leave the UFS2 page cache unflushed,
+       so startup log lines are fsync'd to survive a crash. Disabled once
+       g_log_fsync is cleared (guest running) to avoid per-line stalls. */
+    if(g_log_fsync && g_logf != stderr) fsync(fileno(g_logf));
+#endif
+  }
   if(lvl<=1 || g_verbose>=2) fputs(buf,stderr);
   pm_unlock(&g_logm);
 }
@@ -420,6 +433,249 @@ int plat_text_input(const u16* def, u16* out, int max){
 #include <signal.h>
 #include <sched.h>
 #include <errno.h>
+/* OrbisOS (FreeBSD 9 derived) has no MAP_NORESERVE macro. A PROT_NONE anonymous
+   mapping is already lazily backed there, so treating the flag as 0 is correct.
+   Verified against the PS5 payload SDK: sys/mman.h only has the historical
+   MAP_RESERVED0040 comment, no MAP_NORESERVE. */
+#ifndef MAP_NORESERVE
+#define MAP_NORESERVE 0
+#endif
+
+#ifdef SWR_PS5
+/* OrbisOS (FreeBSD 9 derived) never implemented MAP_NORESERVE: its sys/mman.h
+   calls the old bit MAP_RESERVED0040. A MAP_ANONYMOUS reservation is therefore
+   checked against physical memory + swap, so the 128 GB guest address space is
+   refused outright (confirmed on hardware: "Could not reserve 128 GB of virtual
+   memory for the game."). Reserve pure virtual address space with
+   sceKernelReserveVirtualRange() and commit pages on demand with mmap(MAP_FIXED)
+   -- the same pattern EglantinePS5 uses for its fastmem window.
+
+   Measured on hardware with tools/ps5/ps5_va_probe.c: the 16 GiB ceiling is
+   NOT a per-call size limit, it is the LOW address region. hint=NULL places
+   the window at 0x200200000 where only 16 GiB of contiguous VA is free; a
+   hint inside the CPU map range (>= 0x1000000000) grants the full 128 GiB in
+   ONE call with the hint honoured exactly. MAP_FIXED reserve on a fresh low
+   address (0x600200000) killed the process, while the same call at a high
+   address succeeds. AS_SIZE is 128 GiB and every guest region is an offset
+   into ONE contiguous host reservation, so shrinking the layout would change
+   guest-visible addresses. Reserve the whole window once at a high hint. */
+extern int   sceKernelReserveVirtualRange(void** addr, size_t len, int flags, size_t alignment);
+extern int64_t sceKernelGetDirectMemorySize(void);
+#define SWR_PS5_VA_GRANULE 0x200000ull   /* 2 MiB, the PS5 "large page" */
+
+static int ps5_reserve_at(void* want, u64 size, int flags, void** out){
+  void* p = want;
+  int rc = sceKernelReserveVirtualRange(&p, (size_t)size, flags, SWR_PS5_VA_GRANULE);
+  if(out) *out = p;
+  return rc;
+}
+
+/* ---- large zero-filled allocations that bypass the tiny OrbisOS libc heap ----
+   Measured on hardware (2026-11-08): build_dispatch's calloc(87.8 MiB) returns
+   NULL with errno=12 (ENOMEM) although the console reports 12 GiB of direct
+   memory. The CRT heap cannot grow that far. Anonymous mmap is zero-filled and
+   does not use the libc heap; if the kernel refuses it, fall back to explicit
+   direct-memory allocation + mapping -- the exact path EglantinePS5 and the
+   nxnative PoC use for their guest windows. Both attempts are logged, so one
+   console run shows which path works and the real pool size. */
+extern int32_t sceKernelAllocateDirectMemory(int64_t search_start, int64_t search_end,
+                                             size_t size, size_t alignment, int type,
+                                             int64_t* physical);
+extern int32_t sceKernelMapDirectMemory(void** address, size_t size, int protection,
+                                        int flags, int64_t physical, size_t alignment);
+extern int32_t sceKernelReleaseDirectMemory(int64_t physical, size_t size);
+
+void* ps5_alloc_large(u64 size){
+  u64 bytes = size ? size : 1;
+  u64 aligned = (bytes + SWR_PS5_VA_GRANULE-1) & ~(SWR_PS5_VA_GRANULE-1);
+  void* p = mmap(NULL, (size_t)aligned, PROT_READ|PROT_WRITE,
+                 MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+  LOG("mem: alloc_large: mmap(%llu MiB) -> %p errno=%d\n",
+      (unsigned long long)(aligned>>20), p, p==MAP_FAILED? errno : 0);
+  if(p != MAP_FAILED) return p;   /* anonymous pages are already zero-filled */
+  int64_t phys = -1, total = sceKernelGetDirectMemorySize();
+  int rc = sceKernelAllocateDirectMemory(0, total, (size_t)aligned,
+                                         SWR_PS5_VA_GRANULE, 12, &phys);
+  LOG("mem: alloc_large: direct(%llu MiB) rc=%d phys=%lld pool=%lld MiB\n",
+      (unsigned long long)(aligned>>20), rc, (long long)phys, (long long)(total>>20));
+  if(rc) return NULL;
+  void* q = NULL;
+  int mr = sceKernelMapDirectMemory(&q, (size_t)aligned, PROT_READ|PROT_WRITE, 0,
+                                    phys, SWR_PS5_VA_GRANULE);
+  LOG("mem: alloc_large: map_direct rc=%d addr=%p\n", mr, q);
+  if(mr || !q){ sceKernelReleaseDirectMemory(phys, (size_t)aligned); return NULL; }
+  memset(q, 0, (size_t)aligned);
+  return q;
+}
+
+/* Companion to ps5_alloc_large. The mmap path only needs munmap(); the
+   direct-memory fallback would additionally need sceKernelReleaseDirectMemory,
+   but that path is only a fallback and these are one-shot startup buffers. */
+void ps5_free_large(void* p, u64 size){
+  if(!p || p==MAP_FAILED) return;
+  u64 bytes = size ? size : 1;
+  u64 aligned = (bytes + SWR_PS5_VA_GRANULE-1) & ~(SWR_PS5_VA_GRANULE-1);
+  int rc = munmap(p,(size_t)aligned);
+  LOG("mem: free_large: munmap(%p, %llu MiB) rc=%d\n",p,
+      (unsigned long long)(aligned>>20),rc);
+}
+
+/* ---- 2 MiB-granule commit tracking -------------------------------------
+   sceKernelReserveVirtualRange() reserves the window with 2 MiB alignment,
+   and OrbisOS only accepts MAP_FIXED anonymous commits on those boundaries.
+   Measured on hardware: a 4 KiB-aligned 36 MiB commit at 0x1008021000
+   (guest base 0x8021000, which is not a granule boundary) returns EINVAL(22),
+   while the 128 KiB rtld commit at 0x1008000000 succeeds. EglantinePS5's
+   MapChunks and the nxnative PoC both commit whole Granule-sized chunks.
+   Track which granules already have a mapping so a later commit for a
+   neighbouring guest page does not replace an existing mapping (which would
+   silently reset its mprotect permissions). */
+#define SWR_PS5_MAX_GRANULES 65536u          /* VA window index cap: 128 GiB / 2 MiB */
+#define SWR_PS5_SUBPAGE      0x1000ull       /* 4 KiB guest subpage */
+#define SWR_PS5_SUBS_PER_G   (SWR_PS5_VA_GRANULE/SWR_PS5_SUBPAGE)  /* 512 subpages per granule */
+#define SWR_PS5_PT_LIMIT     16384u          /* hardware CPU page-table hard cap (one per 2 MiB map) */
+#define SWR_PS5_PT_WATERMARK 14336u          /* safety watermark, leaves headroom for GPU/JIT/system */
+
+static u8* g_ps5_win;
+static u64 g_ps5_win_size;
+/* One 512-bit bitmap per granule: which 4 KiB subpages are currently backed.
+   65536 * 64 B = 4 MiB of BSS. Replaces the old 1-bit "ever committed" bitmap,
+   which could not tell a live granule from an empty one. */
+static u8  g_ps5_sub[SWR_PS5_MAX_GRANULES][SWR_PS5_SUBS_PER_G/8];
+/* Live count of granules that actually occupy a CPU page table (hardware-capped). */
+static volatile u32 g_ps5_pt_used;
+/* Read-only shared zero page: GPU sparse ranges with nothing bound are mapped to
+   it so a GPU read never hits a fatal page fault. */
+static u8* g_zero_page;
+
+static void ps5_window_set(u8* base, u64 size){
+  g_ps5_win=base; g_ps5_win_size=size;
+  memset(g_ps5_sub,0,sizeof g_ps5_sub);
+  g_ps5_pt_used=0;
+  LOG("mem: window set base=%p size=%llu MiB; subpage bitmap %zu KiB, pt_used reset to 0\n",
+      (void*)base,(unsigned long long)(size>>20),(size_t)(sizeof g_ps5_sub>>10));
+}
+
+/* Stats entry for overlay/log: current page-table usage, hard limit, watermark. */
+void plat_ps5_pt_stats(u32* used, u32* limit, u32* wm){
+  if(used)  *used  = g_ps5_pt_used;
+  if(limit) *limit = SWR_PS5_PT_LIMIT;
+  if(wm)    *wm    = SWR_PS5_PT_WATERMARK;
+}
+
+/* Allocate one read-only 2 MiB shared zero page at startup. Returns 0 on success. */
+int mem_zero_page_init(void){
+  const u64 G=SWR_PS5_VA_GRANULE;
+  void* z=mmap(NULL,(size_t)G,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+  if(z==MAP_FAILED){ LOG("mem: zero page mmap FAILED errno=%d\n",errno); return -1; }
+  memset(z,0,G);
+  if(mprotect(z,(size_t)G,PROT_READ)){
+    LOG("mem: zero page mprotect(PROT_READ) FAILED errno=%d\n",errno);
+    munmap(z,(size_t)G); return -1;
+  }
+  g_zero_page=(u8*)z;
+  LOG("mem: shared zero page ready at %p (%llu KiB, read-only)\n",
+      (void*)g_zero_page,(unsigned long long)(G>>10));
+  return 0;
+}
+u8* mem_zero_page(void){ return g_zero_page; }
+
+static int ps5_commit_granule(void* a){
+  u64 G=SWR_PS5_VA_GRANULE;
+  void* r=mmap(a,(size_t)G,PROT_READ|PROT_WRITE,
+               MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED,-1,0);
+  if(r!=MAP_FAILED) return 0;
+  int e=errno;
+  /* Fallback: explicitly allocate a physical large page and map it fixed --
+     the EglantinePS5 MapChunks path. Logged so one run tells us whether the
+     alignment assumption or the allocator was the problem. */
+  int64_t phys=-1, total=sceKernelGetDirectMemorySize();
+  int rc=sceKernelAllocateDirectMemory(0,total,(size_t)G,G,12,&phys);
+  void* q=a;
+  int mr = rc ? rc : sceKernelMapDirectMemory(&q,(size_t)G,
+                  PROT_READ|PROT_WRITE,MAP_FIXED,phys,G);
+  LOG("mem: commit fallback at %p: mmap errno=%d direct rc=%d phys=%lld map rc=%d addr=%p\n",
+      a,e,rc,(long long)phys,mr,q);
+  if(mr || q!=a){ if(!rc && phys>=0) sceKernelReleaseDirectMemory(phys,(size_t)G); return -1; }
+  return 0;
+}
+
+/* Reserve [base, base+size) as ONE contiguous window.
+   Hardware probe tools/ps5/ps5_va_probe.c (2026-11-08) settled the question:
+     hint=NULL / 0x300000000        -> 16 GiB ok, 32 GiB+ rc=0x8002000C
+     hint=0x1000000000 / 0x2000000000 -> 16/32/64/128 GiB ALL rc=0, exact hint
+     mmap + MAP_NORESERVE(0x40)     -> EINVAL; plain mmap -> ENOMEM
+     mmap(MAP_FIXED) commit -> touch -> munmap -> re_reserve -> all OK
+     MAP_FIXED reserve on a fresh high address -> rc=0 (NOT fatal)
+   So the 16 GiB ceiling was the LOW address region, not a per-call size limit:
+   hint=NULL lands at 0x200200000 where only 16 GiB of contiguous VA is free,
+   and chaining a second segment at 0x600200000 killed the process. A high hint
+   inside the CPU map range [0x300000000, 0x4000000000) grants the whole
+   AS_SIZE in ONE call. No segmentation, no change to AS_SIZE or any
+   guest-visible address. */
+static u8* ps5_reserve_window(u64 size){
+  static const uintptr_t hints[] = {
+    0x1000000000ull,   /* [64,192) GiB -- comfortably inside the CPU map range */
+    0x2000000000ull,   /* [128,256) GiB -- upper edge, still legal */
+    0x0400000000ull,   /* 16 GiB */
+    0x300000000ull,    /* 12 GiB */
+    0                  /* kernel's own choice (16 GiB ceiling) */
+  };
+  for(unsigned i=0; i<sizeof hints/sizeof hints[0]; ++i){
+    void* hint = (void*)hints[i];
+    void* p = hint;
+    int rc = ps5_reserve_at(hint, size, 0, &p);
+    LOG("mem:   reserve %6llu MiB hint=%p -> rc=%d addr=%p\n",
+        (unsigned long long)(size>>20), hint, rc, p);
+    if(rc || !p || p == MAP_FAILED) continue;
+    if((uintptr_t)p % SWR_PS5_VA_GRANULE || (uintptr_t)p + size < (uintptr_t)p){
+      LOG("mem:   unusable placement (unaligned/wrap), releasing\n");
+      munmap(p, (size_t)size);
+      continue;
+    }
+    LOG("mem: window OK: 1 x %llu MiB at %p..%p\n",
+        (unsigned long long)(size>>20), p, (void*)((u8*)p+size));
+    /* Prove commit -> touch -> decommit -> re-reserve at BOTH ends of the
+       full window before the guest starts using it. One console run then
+       covers VA placement and the page-commit path together. */
+    { u64 ends[2] = { 0, size - SWR_PS5_VA_GRANULE };
+      for(int e=0;e<2;++e){
+        u8* at = (u8*)p + ends[e];
+        void* r = mmap(at, (size_t)SWR_PS5_VA_GRANULE, PROT_READ|PROT_WRITE,
+                       MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, -1, 0);
+        if(r == at){
+          volatile u8* q = (volatile u8*)at;
+          q[0]=0x5A; q[SWR_PS5_VA_GRANULE-1]=0xA5;
+          LOG("mem: commit selftest end=%d off=%llu MiB touch=%02x/%02x OK\n",
+              e, (unsigned long long)(ends[e]>>20), q[0], q[SWR_PS5_VA_GRANULE-1]);
+          int mu = munmap(at, (size_t)SWR_PS5_VA_GRANULE);
+          void* again = at;
+          int rr = ps5_reserve_at(at, SWR_PS5_VA_GRANULE, MAP_FIXED, &again);
+          LOG("mem: decommit selftest end=%d munmap=%d re_reserve rc=%d addr=%p %s\n",
+              e, mu, rr, again, (!mu && !rr && again==at)? "OK" : "FAILED");
+        } else {
+          LOG("mem: commit selftest end=%d mmap(MAP_FIXED) FAILED got=%p errno=%d\n",
+              e, r, errno);
+        }
+      }
+    }
+    return (u8*)p;
+  }
+  /* Fallback for other firmware/layout variants: report the largest single
+     window the high hint grants, so the next change is driven by a measured
+     number. Never silently hand back a smaller AS_SIZE. */
+  for(u64 s = size>>1; s >= (1ull<<30); s >>= 1){
+    void* hint = (void*)0x1000000000ull;
+    void* q = hint;
+    int r2 = ps5_reserve_at(hint, s, 0, &q);
+    LOG("mem:   probe %6llu MiB -> rc=%d addr=%p\n",
+        (unsigned long long)(s>>20), r2, q);
+    if(r2 == 0 && q) munmap(q, (size_t)s);
+  }
+  LOG("mem: no usable %llu MiB window at any hint\n", (unsigned long long)(size>>20));
+  return NULL;
+}
+#endif
 
 void pm_init(PMutex* m){ pthread_mutex_init(&m->l,NULL); }
 
@@ -444,8 +700,75 @@ typedef struct { PThreadFn fn; void* arg; } TArg;
 static void* tstart(void* p){ TArg a=*(TArg*)p; free(p); a.fn(a.arg); return NULL; }
 
 int plat_thread(PThreadFn fn, void* arg, size_t stack){
-  TArg* a=malloc(sizeof *a); a->fn=fn; a->arg=arg; pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setstacksize(&at,stack);
-  pthread_attr_setdetachstate(&at,PTHREAD_CREATE_DETACHED); pthread_t t; int r=pthread_create(&t,&at,tstart,a); pthread_attr_destroy(&at); return r? -1 : 0; }
+#if defined(SWR_PS5)
+  /* Measured on hardware (2026-11-09): the title reaches the first guest
+     thread after committing ~3.2 GiB of direct memory for the guest heap, and
+     pthread_create() with the 4 MiB stack kthread_start() asks for then fails
+     ("FATAL: could not create a system thread").  The small 64/256 KiB runtime
+     threads at boot do start, so the limit is resource-dependent, not a broken
+     pthread implementation.  Try a decreasing ladder, then an explicit stack
+     carved out of direct memory (which bypasses libc's anonymous mmap for the
+     stack).  Log every rung: one icon tap tells which path works and what the
+     real error code is, instead of losing the return value like before. */
+  struct { size_t size; int custom; } tries[] = {
+    { stack,     0 },   /* what the caller asked for */
+    { 1u<<20,    0 },
+    { 256u<<10,  0 },
+    { 0,         0 },   /* libc default stack */
+    { stack,     1 },   /* explicit direct-memory stack */
+    { 1u<<20,    1 },
+  };
+  const unsigned ntry = (unsigned)(sizeof tries/sizeof *tries);
+  for(unsigned i=0;i<ntry;i++){
+    size_t sz=tries[i].size;
+    void* custom=NULL;
+    pthread_attr_t at; int ar=pthread_attr_init(&at);
+    if(ar){ LOG("thread: try=%u pthread_attr_init rc=%d, giving up\n",i,ar); return -1; }
+    int sr=0;
+    if(tries[i].custom){
+      if(sz < (64u<<10)) sz=64u<<10;
+      sz=(sz+0xFFFull)&~0xFFFull;
+      custom=ps5_alloc_large(sz);
+      if(!custom){
+        LOG("thread: try=%u custom stack alloc %llu KiB FAILED\n",
+            i,(unsigned long long)(sz>>10));
+        pthread_attr_destroy(&at); continue;
+      }
+      sr=pthread_attr_setstack(&at,custom,sz);
+    } else if(sz){
+      sr=pthread_attr_setstacksize(&at,sz);
+    }
+    int dr=pthread_attr_setdetachstate(&at,PTHREAD_CREATE_DETACHED);
+    TArg* a=(TArg*)malloc(sizeof *a);
+    if(!a){
+      LOG("thread: try=%u TArg malloc FAILED (CRT heap exhausted?)\n",i);
+      if(custom) ps5_free_large(custom,sz);
+      pthread_attr_destroy(&at); continue;
+    }
+    a->fn=fn; a->arg=arg;
+    pthread_t t; int r=pthread_create(&t,&at,tstart,a);
+    int e=errno;
+    pthread_attr_destroy(&at);
+    LOG("thread: try=%u stack=%llu KiB custom=%d attr=%d/%d/%d pthread_create rc=%d errno=%d\n",
+        i,(unsigned long long)(sz>>10),tries[i].custom,ar,sr,dr,r,e);
+    if(!r){
+      LOG("thread: started tid=%llx stack=%llu KiB custom=%d (a custom stack stays mapped for the process lifetime)\n",
+          (unsigned long long)(uintptr_t)t,(unsigned long long)(sz>>10),tries[i].custom);
+      return 0;
+    }
+    free(a);
+    if(custom) ps5_free_large(custom,sz);
+  }
+  LOG("thread: all %u attempts failed, requested stack=%llu KiB\n",
+      ntry,(unsigned long long)(stack>>10));
+  return -1;
+#else
+  TArg* a=malloc(sizeof *a); if(!a) return -1; a->fn=fn; a->arg=arg;
+  pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setstacksize(&at,stack);
+  pthread_attr_setdetachstate(&at,PTHREAD_CREATE_DETACHED); pthread_t t;
+  int r=pthread_create(&t,&at,tstart,a); pthread_attr_destroy(&at); return r? -1 : 0;
+#endif
+}
 
 void plat_thread_exit(void){ pthread_exit(NULL); }
 
@@ -465,37 +788,323 @@ u64 plat_ns(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); retur
 
 i64 plat_unix_time(void){ return (i64)time(NULL); }
 
+#ifdef SWR_PS5
+/* OrbisOS stub libs export localtime() but not localtime_r(). */
+i64 plat_tz_offset(void){ time_t t=time(NULL); struct tm* lt=localtime(&t); return lt? (i64)lt->tm_gmtoff : 0; }
+#else
 i64 plat_tz_offset(void){ time_t t=time(NULL); struct tm lt; localtime_r(&t,&lt); return (i64)lt.tm_gmtoff; }
+#endif
 
 int g_ww_ok;
 
 int plat_ww_collect(u8* base, u64 size, void (*cb)(u64)){ (void)base; (void)size; (void)cb; return -1; }
 
-u8* plat_vm_reserve(u64 size){ void* p=mmap(NULL,size,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE,-1,0); return p==MAP_FAILED? NULL : (u8*)p; }
+u8* plat_vm_reserve(u64 size){
+#ifdef SWR_PS5
+  LOG("mem: PS5 direct memory %lld MiB, requesting %llu MiB of VA\n",
+      (long long)(sceKernelGetDirectMemorySize()>>20), (unsigned long long)(size>>20));
+  void* p0 = mmap(NULL,size,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE,-1,0);
+  LOG("mem: mmap(PROT_NONE,MAP_ANON) -> %s errno=%d\n",
+      p0==MAP_FAILED? "FAILED" : "OK", p0==MAP_FAILED? errno : 0);
+  if(p0 != MAP_FAILED){ ps5_window_set((u8*)p0,size); return (u8*)p0; }
+  /* Plain mmap cannot back 128 GiB here (ENOMEM) and the 0x40 MAP_NORESERVE
+     bit is rejected (EINVAL). Keep this attempt as a durable diagnostic,
+     then use the high-hint reserve path. */
+  { u8* r=ps5_reserve_window(size); if(r) ps5_window_set(r,size); return r; }
+#else
+  void* p=mmap(NULL,size,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE,-1,0); return p==MAP_FAILED? NULL : (u8*)p;
+#endif
+}
 
 void plat_vm_readonly(u8* p, u64 size){ mprotect(p,size,PROT_READ); }
-int plat_vm_commit(u8* p, u64 size){ return mprotect(p,size,PROT_READ|PROT_WRITE); }
 
-void plat_vm_decommit(u8* p, u64 size){ madvise(p,size,MADV_DONTNEED); mprotect(p,size,PROT_NONE); }
+#ifdef SWR_PS5
+static int ps5_granule_empty(u64 gi){
+  for(int b=0;b<SWR_PS5_SUBS_PER_G/8;++b)
+    if(g_ps5_sub[gi][b]) return 0;
+  return 1;
+}
+#endif
 
+int plat_vm_commit(u8* p, u64 size){
+#ifdef SWR_PS5
+  if(!size) return 0;
+  const u64 G=SWR_PS5_VA_GRANULE, SP=SWR_PS5_SUBPAGE;
+  u64 lo=(u64)(uintptr_t)p, hi=lo+size;
+  u64 a0=lo & ~(G-1), a1=(hi+G-1)&~(G-1);
+  u64 win=(u64)(uintptr_t)g_ps5_win;
+  int made=0, reused=0, failed=0;
+  u32 pt_before=g_ps5_pt_used;
+  for(u64 a=a0; a<a1; a+=G){
+    if(!win || a<win || a>=win+g_ps5_win_size){ ++failed; LOG("mem: commit OUT OF WINDOW at %p\n",(void*)a); break; }
+    u64 idx=(a-win)/G;
+    if(idx>=SWR_PS5_MAX_GRANULES){ ++failed; LOG("mem: commit granule index %llu >= cap\n",(unsigned long long)idx); break; }
+    int was_empty=ps5_granule_empty(idx);
+    if(was_empty){
+      u32 cur=__atomic_load_n(&g_ps5_pt_used,__ATOMIC_SEQ_CST);
+      if(cur>=SWR_PS5_PT_LIMIT){
+        ++failed;
+        LOG("mem: commit PT HARD LIMIT reached used=%u limit=%u at %p -> failing for OOM recovery\n",
+            cur,SWR_PS5_PT_LIMIT,(void*)a);
+        break;
+      }
+      if(cur>=SWR_PS5_PT_WATERMARK){
+        LOG("mem: commit at watermark used=%u wm=%u, invoking reclaim\n",cur,SWR_PS5_PT_WATERMARK);
+        if(mem_reclaim_pt(SWR_PS5_PT_WATERMARK)!=0)
+          LOG("mem: reclaim could not drop below watermark (used=%u), continuing while under hard limit\n",
+              (u32)g_ps5_pt_used);
+      }
+      if(ps5_commit_granule((void*)a)){
+        ++failed;
+        LOG("mem: commit granule mmap(%p,%llu KiB) FAILED errno=%d\n",
+            (void*)a,(unsigned long long)(G>>10),errno);
+        break;
+      }
+      __atomic_add_fetch(&g_ps5_pt_used,1,__ATOMIC_SEQ_CST);
+      ++made;
+      LOG("mem: commit NEW granule %p idx=%llu -> pt_used now %u\n",
+          (void*)a,(unsigned long long)idx,(u32)g_ps5_pt_used);
+    } else {
+      ++reused;
+    }
+    /* mark the 4 KiB subpages this request covers inside the granule */
+    u64 s_lo=(a>lo?a:lo)-a, s_hi=(a+G<hi?a+G:hi)-a;
+    for(u64 s=s_lo;s<s_hi;s+=SP){
+      u32 bit=(u32)(s/SP);
+      g_ps5_sub[idx][bit>>3]|=(u8)(1u<<(bit&7));
+    }
+  }
+  { static u32 calls=0; ++calls;
+    if(failed || made || calls<=32)
+      LOG("mem: commit %llu KiB at %p -> granules %llx..%llx made=%d reused=%d failed=%d pt_used %u->%u\n",
+          (unsigned long long)(size>>10),(void*)p,(unsigned long long)a0,
+          (unsigned long long)a1,made,reused,pt_before,(u32)g_ps5_pt_used); }
+  if(failed) return -1;
+  /* Exact 4 KiB protection for just the requested slice. Newly mapped
+     granules are already RW; this also restores previously PROT_NONE slices. */
+  if(mprotect(p,(size_t)size,PROT_READ|PROT_WRITE)){
+    static int said; if(!said){ said=1; LOG("mem: commit mprotect(%p,%llu) FAILED errno=%d\n",
+                                            (void*)p,(unsigned long long)size,errno); }
+    return -1;
+  }
+  return 0;
+#else
+  return mprotect(p,size,PROT_READ|PROT_WRITE);
+#endif
+}
+
+void plat_vm_decommit(u8* p, u64 size){
+#ifdef SWR_PS5
+  if(!size) return;
+  const u64 G=SWR_PS5_VA_GRANULE, SP=SWR_PS5_SUBPAGE;
+  u64 win=(u64)(uintptr_t)g_ps5_win;
+  u64 lo=(u64)(uintptr_t)p, hi=lo+size;
+  u64 a0=lo & ~(G-1), a1=(hi+G-1)&~(G-1);
+  int released=0, partial=0;
+  for(u64 a=a0;a<a1;a+=G){
+    if(!win || a<win || a>=win+g_ps5_win_size){ LOG("mem: decommit OUT OF WINDOW at %p\n",(void*)a); break; }
+    u64 idx=(a-win)/G;
+    if(idx>=SWR_PS5_MAX_GRANULES){ LOG("mem: decommit granule index %llu >= cap\n",(unsigned long long)idx); break; }
+    /* clear the 4 KiB subpages this release covers */
+    u64 s_lo=(a>lo?a:lo)-a, s_hi=(a+G<hi?a+G:hi)-a;
+    for(u64 s=s_lo;s<s_hi;s+=SP){
+      u32 bit=(u32)(s/SP);
+      g_ps5_sub[idx][bit>>3]&=(u8)~(1u<<(bit&7));
+    }
+    if(ps5_granule_empty(idx)){
+      /* whole granule empty: free the page table, then restore a PROT_NONE
+         reservation at the same address so the window stays contiguous. */
+      madvise((void*)a,G,MADV_DONTNEED);
+      if(munmap((void*)a,G)!=0){
+        LOG("mem: decommit munmap(%p) FAILED errno=%d, keeping mapping\n",(void*)a,errno);
+        continue;
+      }
+      __atomic_sub_fetch(&g_ps5_pt_used,1,__ATOMIC_SEQ_CST);
+      void* again=(void*)a;
+      int rr=ps5_reserve_at((void*)a,G,MAP_FIXED,&again);
+      ++released;
+      LOG("mem: decommit granule %p fully empty -> munmap+re-reserve rc=%d addr=%p, pt_used now %u\n",
+          (void*)a,rr,again,(u32)g_ps5_pt_used);
+    } else {
+      /* partial release: keep the granule mapped, discard backing, drop protection */
+      madvise(p,(size_t)size,MADV_DONTNEED);
+      mprotect(p,(size_t)size,PROT_NONE);
+      ++partial;
+    }
+  }
+  LOG("mem: decommit %llu KiB at %p -> granules %llx..%llx released=%d partial=%d pt_used now %u\n",
+      (unsigned long long)(size>>10),(void*)p,(unsigned long long)a0,
+      (unsigned long long)a1,released,partial,(u32)g_ps5_pt_used);
+#else
+  madvise(p,size,MADV_DONTNEED); mprotect(p,size,PROT_NONE);
+#endif
+}
+
+#ifdef SWR_PS5
+/* Native titles are statically linked: load_code() takes the swr_module_static
+   branch and never dlopens anything. OrbisOS rejects unsigned dlopen anyway,
+   and no SDK stub exports dlopen/dlsym, so remove the references entirely. */
+void* plat_dl_open(const char* path){ (void)path; return NULL; }
+void* plat_dl_sym(void* h, const char* n){ (void)h; (void)n; return NULL; }
+#else
 void* plat_dl_open(const char* path){ return dlopen(path,RTLD_NOW|RTLD_LOCAL); }
-
 void* plat_dl_sym(void* h, const char* n){ return dlsym(h,n); }
+#endif
 
 int plat_mkdir(const char* p){ return mkdir(p,0755); }
 
 int plat_is_dir(const char* p){ struct stat s; return !stat(p,&s) && S_ISDIR(s.st_mode); }
 
-typedef struct { DIR* d; char path[1024]; } PD_;
+typedef struct { DIR* d; char path[1024]; int* idx; int n, i; } PD_;
 
-int plat_dir_open(PDir* d, const char* path){ PD_* p=malloc(sizeof *p); p->d=opendir(path); if(!p->d){ free(p); return -1; } strncpy(p->path,path,1023); p->path[1023]=0; d->h=p; return 0; }
+#ifdef SWR_PS5
+/* OrbisOS refuses opendir() on the read-only /app0 mount even though stat()
+   and fopen() work: measured "romfs: opendir(/app0/swr_data/romfs) -> 0
+   errno=1", after which RomFS came back as "1 folders, 0 files" and every
+   asset was invisible to the guest.  A build-time manifest of the deployed
+   package replaces directory enumeration.  One tab-separated line per entry:
+
+       D|F <dir> <name> <size>
+
+   <dir> is the *guest* directory path, e.g. /app0/swr_data/romfs/Models.
+   The generator writes a structured report; this loader logs the parsed
+   totals so the two views can be compared from swr.log alone. */
+typedef struct { char* dir; char* name; int is_dir; u64 size; } ManEnt;
+static ManEnt* g_man; static int g_nman, g_cman, g_man_loaded;
+char g_diag_manopen_dir[2048]; void* g_man_mmap; long g_man_msz;
+
+/* Independent, fsync-backed diagnostic so romfs events survive a hard crash
+   (LOG may be buffered and lost on _exit).  Appended to a separate file; the
+   first call each run truncates so a fresh boot starts clean. */
+void romfs_diag(const char* m){
+  static int first=1;
+  FILE* f=fopen("/data/switchrecomp/romfs_diag.log", first? "w":"a");
+  first=0;
+  if(f){ fwrite(m,1,strlen(m),f); fflush(f); fsync(fileno(f)); fclose(f); }
+}
+
+static void man_load(void){
+  { char b[64]; snprintf(b,sizeof b,"MAN_LOAD_ENTER g_man_loaded=%d\n", g_man_loaded); romfs_diag(b); }
+  if(g_man_loaded) return; g_man_loaded=1;
+  const char* path="/mnt/usb1/PPSA99201/romfs_manifest.txt";
+  FILE* f=fopen(path,"rb");
+  { char b[128]; snprintf(b,sizeof b,"MAN_LOAD_OPEN path=%s ok=%d errno=%d\n",path,!!f,errno); romfs_diag(b); }
+  if(!f){ LOG("romfs: manifest not found at %s (errno=%d)\n",path,errno); return; }
+  /* Map the manifest privately: fields are NUL-terminated in place (copy-on-
+     write) so we keep zero heap-allocated string copies.  The entry array is
+     taken from an anonymous mapping, so the ENTIRE manifest lives outside the
+     libc heap.  This avoids both the realloc() growth that previously returned
+     NULL at 65536 entries and the ~75k strdup() calls that fragmented the
+     allocator.  Measured crash was a NULL g_man written at offset 65536*32 =
+     0x200000, i.e. exactly the fault address. */
+  fseek(f,0,SEEK_END); long sz=(long)ftell(f); fseek(f,0,SEEK_SET);
+  int fd=fileno(f);
+  char* m=mmap(NULL,(size_t)(sz>0?sz:1),PROT_READ|PROT_WRITE,MAP_PRIVATE,fd,0);
+  fclose(f);
+  if(m==MAP_FAILED){ LOG("romfs: mmap(%s) failed errno=%d\n",path,errno); return; }
+  g_man_mmap=m; g_man_msz=sz;
+  /* Pass 1: count lines so the array is allocated exactly once (no realloc). */
+  long n=0; for(long i=0;i<sz;i++) if(m[i]=='\n') n++;
+  g_nman=0; g_cman=(int)n+1;
+  g_man=mmap(NULL,sizeof(ManEnt)*(size_t)g_cman,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+  if(g_man==MAP_FAILED){ LOG("romfs: anon mmap for %d entries failed errno=%d\n",g_cman,errno);
+    munmap(m,(size_t)sz); return; }
+  { char b[80]; snprintf(b,sizeof b,"MAN_MAP n=%ld cman=%d man=%p mmap=%p\n",n,g_cman,(void*)g_man,(void*)m); romfs_diag(b); }
+  /* Pass 2: parse in place, pointing dir/name straight into the mapping. */
+  char* p=m; char* end=m+sz; int lines=0,ndir=0,nfile=0; u64 total=0;
+  while(p<end){
+    char* nl=memchr(p,'\n',(size_t)(end-p));
+    char* line_end=nl? nl:end;
+    if(nl) *nl='\0';
+    char* a=p; char* d=strchr(a,'\t'); if(!d){ p=line_end+1; continue; } *d++='\0';
+    char* nm=strchr(d,'\t'); if(!nm){ p=line_end+1; continue; } *nm++='\0';
+    char* szp=strchr(nm,'\t'); if(!szp){ p=line_end+1; continue; } *szp++='\0';
+    int isdir=(a[0]=='D'||a[0]=='d'); u64 size=strtoull(szp,NULL,10);
+    g_man[g_nman].dir=d; g_man[g_nman].name=nm;
+    g_man[g_nman].is_dir=isdir; g_man[g_nman].size=size; g_nman++;
+    if(isdir) ndir++; else { nfile++; total+=size; }
+    lines++;
+    if((lines%10000)==0){ char bb[48]; snprintf(bb,sizeof bb,"MAN_ITER lines=%d nman=%d\n",lines,g_nman); romfs_diag(bb); }
+    p=line_end+1;
+  }
+  LOG("romfs: manifest %s -> %d lines, %d entries (%d dirs, %d files, %.2f GiB)\n",
+      path,lines,g_nman,ndir,nfile,(double)total/1073741824.0);
+  { char b[96]; snprintf(b,sizeof b,"MAN_LOAD_DONE lines=%d nman=%d ndir=%d nfile=%d\n",lines,g_nman,ndir,nfile); romfs_diag(b); }
+}
+
+static int man_open(const char* path, PD_* p){
+  snprintf(g_diag_manopen_dir,sizeof g_diag_manopen_dir,"%s",path);
+  { static int c; if((c++%50)==0){ char b[1200]; snprintf(b,sizeof b,"MANOPEN dir=%s\n",path); romfs_diag(b); } }
+  romfs_diag("MANOPEN_ENTER\n");
+  man_load();
+  p->idx=NULL; p->n=0; p->i=0;
+  if(!g_nman) return 0;
+  /* Count matches first, then allocate the index exactly once (no realloc
+     growth) -- the previous realloc() loop was the prime suspect for the
+     PS5 libc heap corruption that crashed ~1300 dirs into romfs enumeration. */
+  int cnt=0;
+  for(int i=0;i<g_nman;i++){
+    char* dp=g_man[i].dir;
+    if(dp<(char*)g_man_mmap || dp>=(char*)g_man_mmap+g_man_msz){ romfs_diag("BAD_DIR_ABORT\n"); break; }
+    if(!strcmp(dp,path)) cnt++;
+  }
+  if(!cnt) return 0;
+  p->idx=malloc(sizeof(int)*(size_t)cnt);
+  if(!p->idx){ LOG("romfs: man_open idx malloc(%d) failed\n",cnt); return 0; }
+  p->n=0;
+  for(int i=0;i<g_nman;i++) if(!strcmp(g_man[i].dir,path)) p->idx[p->n++]=i;
+  { static int d; if(d<6){ d++; char b[128]; snprintf(b,sizeof b,"MANOPEN_DONE n=%d path=%s\n",p->n,path); romfs_diag(b); } }
+  return p->n>0;
+}
+
+#endif
+
+int plat_dir_open(PDir* d, const char* path){
+  PD_* p=malloc(sizeof *p); p->d=opendir(path); p->idx=NULL; p->n=0; p->i=0;
+#ifdef SWR_PS5
+  /* One console run has to tell us whether /app0 supports directory
+     enumeration at all; log the first few opens, not all 75k files. */
+  { static int nopen; if(nopen<3){ nopen++; LOG("romfs: opendir(%s) -> %p errno=%d\n",path,(void*)p->d,p->d? 0 : errno); } }
+  if(!p->d){
+    romfs_diag("PDIR_OPEN_FAILED_WILL_MANOPEN\n");
+    if(man_open(path,p)){
+      { static int nman; if(nman<3){ nman++; LOG("romfs: manifest dir %s -> %d entries\n",path,p->n); } }
+      strncpy(p->path,path,1023); p->path[1023]=0; d->h=p; return 0; } }
+#endif
+  if(!p->d){ free(p->idx); free(p); return -1; }
+  strncpy(p->path,path,1023); p->path[1023]=0; d->h=p; return 0; }
 
 int plat_dir_next(PDir* d){ PD_* p=d->h; struct dirent* e;
+#ifdef SWR_PS5
+  if(!p->d){
+    if(p->i>=p->n) return 0;
+    ManEnt* m=&g_man[p->idx[p->i++]];
+    strncpy(d->name,m->name,511); d->name[511]=0;
+    d->is_dir=m->is_dir; d->size=m->size; return 1; }
+#endif
   while((e=readdir(p->d))){ if(!strcmp(e->d_name,".")||!strcmp(e->d_name,"..")) continue; strncpy(d->name,e->d_name,511); d->name[511]=0;
-    char f[1600]; snprintf(f,sizeof f,"%s/%s",p->path,e->d_name); struct stat s; if(stat(f,&s)) continue; d->is_dir=S_ISDIR(s.st_mode); d->size=(u64)s.st_size; return 1; }
+    char f[1600]; snprintf(f,sizeof f,"%s/%s",p->path,e->d_name); struct stat s;
+    if(stat(f,&s)){
+#ifdef SWR_PS5
+      /* OrbisOS' /app0 mount can refuse stat() on individual package files
+         even though fopen()/opendir() work. Dropping those entries silently
+         produced "RomFS: 1 folders, 0 files" on real hardware. Classify with
+         opendir() and read the size with fseek/ftell instead. */
+      { static int said; if(!said){ said=1; LOG("romfs: stat(%s) FAILED errno=%d -> fallback\n",f,errno); } }
+      DIR* t=opendir(f);
+      if(t){ closedir(t); d->is_dir=1; d->size=0; return 1; }
+      FILE* fp=fopen(f,"rb"); if(!fp) continue;
+      if(fseek(fp,0,SEEK_END)){ fclose(fp); continue; }
+      long sz=ftell(fp); fclose(fp); if(sz<0) continue;
+      d->is_dir=0; d->size=(u64)sz; return 1;
+#else
+      continue;
+#endif
+    }
+    d->is_dir=S_ISDIR(s.st_mode); d->size=(u64)s.st_size; return 1; }
   return 0; }
 
-void plat_dir_close(PDir* d){ PD_* p=d->h; closedir(p->d); free(p); }
+void plat_dir_close(PDir* d){ PD_* p=d->h; if(p->d) closedir(p->d); free(p->idx); free(p); }
 
 u64 plat_file_size(const char* p){ struct stat s; if(stat(p,&s)) return 0; return (u64)s.st_size; }
 
@@ -526,7 +1135,12 @@ static void sighandler(int sig, siginfo_t* si, void* uc_){
     siglongjmp(*b,1); }
   extern void crash_report(void* host_pc, void* fault_addr, int sig);
   void* pc=NULL;
-#if defined(__x86_64__)
+#if defined(__x86_64__) && (defined(__FreeBSD__) || defined(__PROSPERO__))
+  #include <ucontext.h>
+  /* FreeBSD/OrbisOS mcontext_t has named registers (mc_rip), not Linux's
+     gregs[] + REG_RIP indices. Verified in the PS5 SDK x86/ucontext.h. */
+  ucontext_t* uc=(ucontext_t*)uc_; pc=(void*)uc->uc_mcontext.mc_rip;
+#elif defined(__x86_64__)
   #include <ucontext.h>
   ucontext_t* uc=(ucontext_t*)uc_; pc=(void*)uc->uc_mcontext.gregs[REG_RIP];
 #elif defined(__aarch64__)

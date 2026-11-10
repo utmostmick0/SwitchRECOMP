@@ -519,13 +519,90 @@ def _(g):
         if L: return g.setX('rt', 'ldx(c,M,%s,%d)' % (A, size))
         return g.setW('rs', 'stx(c,M,%s,%d,%s)' % (A, size, g.X('rt')))
     if not o2 and o1:
-        if size < 2: return None
+        if size < 2:
+            # ARMv8.1 CASP/CASPA/CASPL/CASPAL: a PAIR of W (size 0) or X
+            # (size 1) registers. LDXP/STXP only exist for size 2/3, so these
+            # encodings used to produce undef(). Rs/Rs+1 hold the expected pair
+            # and receive the loaded pair, Rt/Rt+1 are stored on success. Rs
+            # must be even. bit22 = A, bit15 = L; the SEQ_CST helper covers
+            # both orderings, so neither needs to be specialised.
+            if g.known('rs') and (g.v('rs') & 1): return None
+            return 'swr_casp(c,M,%s,%s,%s,%s);' % (A, g.f('rs'), g.f('rt'), g.f('size'))
         if L: return '{ u64 v1_,v2_; ldxp(c,M,%s,%d,&v1_,&v2_); %s %s }' % (A, size, g.setX('rt', 'v1_'), g.setX('rt2', 'v2_'))
         return g.setW('rs', 'stxp(c,M,%s,%d,%s,%s)' % (A, size, g.X('rt'), g.X('rt2')))
     if o2 and not o1:
         if L: return g.setX('rt', '*(volatile %s*)MP(%s)' % (['u8', 'u16', 'u32', 'u64'][size], A))
         return '{ %s(%s,%s); SWR_FENCE(); }' % (WR[size], A, g.X('rt'))
-    return None
+    # ARMv8.1 CAS/CASA/CASL/CASAL (o2=1, o1=1). Rs is BOTH the expected value
+    # and the destination for the loaded value, Rt is the value stored on
+    # success. bit22 = A (acquire), bit15 = L (release); a SEQ_CST CAS is a
+    # strict superset of both on every host we support. The helper takes
+    # register indices (not values) because it has to write Rs back.
+    return 'swr_cas(c,M,%s,%s,%s,%s);' % (A, g.f('rs'), g.f('rt'), g.f('size'))
+
+
+# ------------------------------------------------------------------ ARMv8.1 / 8.3 (Switch 2, system 22+)
+# Not part of the original ARMv8.0/A57 table. The patterns below were derived
+# from a full .text census of the Switch 2 dumps and cross-checked against
+# capstone over the whole encoding space; see tools/ps5/pipeline.py, which
+# writes opcode_gaps.json. Register fields are deliberately left as 'x'.
+FIELDS['A'] = (23, 1)       # LSE acquire bit
+FIELDS['Rl'] = (22, 1)      # LSE release bit
+FIELDS['o3'] = (15, 1)      # LSE: 0 = LDADD..LDUMAX, 1 = SWP (opc must be 000)
+FIELDS['aopc'] = (12, 3)    # LSE operation selector
+
+
+# RCpc load-acquire: LDAPR / LDAPRB / LDAPRH. A plain x86 load is already
+# acquire; LDAR_ uses a SEQ_CST atomic load so ARM hosts behave identically.
+# MUST be registered before LSE_ATOMIC: LDAPR is a special case of the same
+# encoding space (Rs=11111, o3=1, opc=100) and would otherwise be swallowed.
+@ins('LDAPR', 'xx 111 000 10 1 11111 110000 xxxxx xxxxx', spec=('size',))
+def _(g):
+    size = g.v('size')
+    e = 'LDAR_(%s,%s)' % (('u8', 'u16', 'u32', 'u64')[size], g.XS('rn'))
+    return g.setX('rt', e) if size == 3 else g.setW('rt', e)
+
+
+# LSE atomic memory operations. Split into two patterns on purpose: an o3=1
+# encoding is only a valid SWP when opc=000. A single wide pattern would also
+# claim reserved encodings (including ST64BV/ST64BV0) and hide them from any
+# future implementation. Rs=31 / Rt=31 store forms are covered too: writing Rt
+# is then a no-op, which is exactly what the store-only variants require.
+def lse_body(g, op):
+    call = 'swr_lse(M,%s,%s,%s,%d)' % (g.XS('rn'), g.X('rs'), g.f('size'), op)
+    return g.setX('rt', call) if g.v('size') == 3 else g.setW('rt', call)
+
+
+@ins('LSE_ATOMIC_RMW', 'xx 111 000 xx 1 xxxxx 0 xxx 00 xxxxx xxxxx',
+     spec=('size', 'A', 'Rl', 'aopc'))
+def _(g):
+    return lse_body(g, g.v('aopc'))      # 0..7 = LDADD/LDCLR/LDEOR/LDSET/SMAX/SMIN/UMAX/UMIN
+
+
+@ins('LSE_ATOMIC_SWP', 'xx 111 000 xx 1 xxxxx 1 000 00 xxxxx xxxxx',
+     spec=('size', 'A', 'Rl'))
+def _(g):
+    return lse_body(g, 8)
+
+
+# Pointer authentication. No PAC keys are emulated on the host, so signing and
+# stripping instructions are no-ops, and RETAA/RETAB are ordinary returns.
+ins('RETAA', '1101011 0010 11111 000010 11111 11111')(lambda g: ('ret', 'c->x[30]'))
+ins('RETAB', '1101011 0010 11111 000011 11111 11111')(lambda g: ('ret', 'c->x[30]'))
+
+
+def _pac_nop(g):
+    return ''
+
+
+for _i, _p in enumerate((
+    '11011010 11000001 00000x xxxxxxxxxx',   # PACIA / PACIB
+    '11011010 11000001 00010x xxxxxxxxxx',   # AUTIA / AUTIB
+    '11011010 11000001 00100x 11111 xxxxx',  # PACIZA / PACIZB
+    '11011010 11000001 00110x 11111 xxxxx',  # AUTIZA / AUTIZB
+    '11011010 11000001 01000x 11111 xxxxx',  # XPACI / XPACD
+)):
+    ins('PAC_NOP%d' % _i, _p)(_pac_nop)
 
 
 # ------------------------------------------------------------------ logical / register arithmetic

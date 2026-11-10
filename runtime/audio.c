@@ -10,7 +10,7 @@
 #include <limits.h>
 #if defined(_WIN32)
 #include <mmsystem.h>
-#else
+#elif !defined(SWR_PS5)
 #include <dlfcn.h>
 #endif
 static u32 rd32(const u8* p){ u32 v; memcpy(&v,p,4); return v; }
@@ -63,13 +63,20 @@ typedef struct { int freq; u16 format; u8 channels,silence; u16 samples,padding;
 static void* sdl_lib; static u32 device;
 static struct { int(*init)(u32); u32(*open)(const char*,int,const AudioSpec*,AudioSpec*,int); void(*pause)(u32,int); int(*queue)(u32,const void*,u32); u32(*queued)(u32); void(*close)(u32); const char*(*error)(void); } sdl;
 static void device_close(void){ if(device) sdl.close(device); device=0; }
-static int host_open(void){ sdl_lib=dlopen("libSDL2-2.0.so.0",RTLD_NOW|RTLD_LOCAL); if(!sdl_lib) sdl_lib=dlopen("libSDL2.so",RTLD_NOW|RTLD_LOCAL); if(!sdl_lib){ WARN("audio: SDL2 not available\n"); return 0; }
+static int host_open(void){
+#ifdef SWR_PS5
+  /* Stage 1 has no sceAudioOut backend yet. Native titles cannot dlopen an
+     unsigned SDL2 anyway, so keep the mixer running with output disabled. */
+  WARN("audio: PS5 stage 1 - sceAudioOut backend not wired yet, output disabled\n"); return 0;
+#else
+  sdl_lib=dlopen("libSDL2-2.0.so.0",RTLD_NOW|RTLD_LOCAL); if(!sdl_lib) sdl_lib=dlopen("libSDL2.so",RTLD_NOW|RTLD_LOCAL); if(!sdl_lib){ WARN("audio: SDL2 not available\n"); return 0; }
 #define SYM(field,name) do{*(void**)(&sdl.field)=dlsym(sdl_lib,name);if(!sdl.field)return 0;}while(0)
   SYM(init,"SDL_InitSubSystem"); SYM(open,"SDL_OpenAudioDevice"); SYM(pause,"SDL_PauseAudioDevice"); SYM(queue,"SDL_QueueAudio"); SYM(queued,"SDL_GetQueuedAudioSize"); SYM(close,"SDL_CloseAudioDevice"); SYM(error,"SDL_GetError");
 #undef SYM
   AudioSpec want={0}; want.freq=48000; want.format=0x8010; want.channels=2; want.samples=1024;
   if(sdl.init(0x10) || (device=sdl.open(NULL,0,&want,NULL,0))==0){ WARN("audio: SDL2 output failed: %s\n",sdl.error()); return 0; }
   sdl.pause(device,0); LOG("audio: SDL2, 48000 Hz stereo PCM16 enabled\n"); return 1;
+#endif
 }
 #endif
 static void host_write(const float* samples,unsigned frames){
